@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+.env
+
+# Node
+node_modules/
+
+# Local Netlify folder
+.netlify
+
+# Private docs (not for public repo)
+docs/
+
+# Deploy configs with local paths
+deploy/
+
+# Planning notes
+planning/
