@@ -1,15 +1,17 @@
-"""OpenAI LLM integration — intent extraction, response generation, and validation.
+"""OpenAI LLM integration — product-aware recommendation with validation.
 
-The LLM handles understanding and communication:
-  1. Multi-turn intent extraction (with pivot detection)
-  2. Contextual clarification questions
-  3. Product-specific recommendation reasoning
-  4. Basket-aware, context-aware response generation
-  5. Natural upsell phrasing
+The LLM receives the full product catalog for the selected store and reasons
+about which products best match the customer's request. It handles:
+  1. Browsing the product dataset to find relevant items
+  2. Multi-turn conversation with refinement and pivot detection
+  3. Contextual clarification when requests are vague
+  4. Product-specific reasoning (dietary, price, taste, portion)
+  5. Basket-aware suggestions (avoids re-recommending basket items)
+  6. Natural upsell phrasing based on curated product pairs
 
-All product decisions remain in the deterministic engine.
-Every LLM output is validated before use — hallucinations get caught and fall back to
-deterministic text.
+Validation layer ensures every product ID the LLM returns exists in the real
+catalog. Hallucinated products are stripped. Falls back to deterministic engine
+if the LLM is unavailable or returns invalid output.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 MAX_TURNS = 4
 
 # ---------------------------------------------------------------------------
-# Allowed value sets (used for validation)
+# Allowed value sets (used for intent validation)
 # ---------------------------------------------------------------------------
 
 VALID_CATEGORIES = {"lunch", "breakfast", "snack", "drink", "unknown"}
@@ -65,6 +67,47 @@ def is_llm_available() -> bool:
 # Prompts (kept as constants for transparency / display in UI)
 # ---------------------------------------------------------------------------
 
+RECOMMEND_SYSTEM = """You are an AI shopping assistant for a food & drink shop.
+You will receive the full product catalog for this store. Your job is to:
+1. Understand what the customer wants from their message (and conversation history if present)
+2. Browse the product catalog and pick the BEST matching products
+3. Explain your reasoning — why each product fits what the customer asked for
+
+Return ONLY valid JSON, no markdown, no explanation outside the JSON. Schema:
+{
+  "recommended_ids": ["id1", "id2"],  // 1-3 product IDs from the catalog
+  "reasoning": "...",                  // 1-2 sentences: why you picked these
+  "message": "...",                    // 2-4 sentences: friendly response to the customer
+  "needs_clarification": false,        // true if the request is too vague to recommend
+  "clarification_question": null       // if needs_clarification is true, ask ONE short question
+}
+
+Product selection rules:
+- Pick 1-3 products. If the customer seems rushed, pick 1. If exploring, pick up to 3.
+- ONLY use product IDs that appear in the catalog below. NEVER invent products.
+- Match on: category, tags, dietary needs, taste, price, portion size, prep time.
+- If the customer has items in their basket, do NOT recommend those again.
+- If you find a relevant upsell_pair on a recommended product, mention it naturally in your message
+  using social proof (e.g. "Most people also grab a..."). Only suggest upsells from the catalog.
+
+Message rules:
+- Be warm and conversational, not robotic.
+- Reference what the customer actually said — show you understood.
+- Mention specific product details (price, dietary info, taste) that are relevant to their request.
+- If this is a follow-up, acknowledge the context ("Since you wanted something lighter...").
+- Do not use markdown formatting. Plain text only.
+- Do not mention scores, algorithms, or internal data.
+
+Multi-turn rules:
+- If the customer REFINES ("something cheaper", "make it vegan"), adjust your picks accordingly.
+- If the customer PIVOTS ("forget that, I want a drink"), start fresh — pick from the new category.
+- Consider conversation history to understand context.
+
+Clarification rules:
+- Only set needs_clarification=true if the request is genuinely too vague (e.g. "food", "anything").
+- If you can make reasonable product picks, do so — don't over-clarify.
+- Keep clarification questions casual and short (1 sentence)."""
+
 INTENT_EXTRACTION_SYSTEM = """You are an intent classifier for a food & drink shop assistant.
 
 Given a customer message (and optionally conversation history), extract structured intent as JSON.
@@ -91,18 +134,6 @@ General rules:
 - Prefer "unknown" over guessing.
 - Return valid JSON only."""
 
-RESPONSE_GENERATION_SYSTEM = """You are a friendly shop assistant. Keep responses concise (2-4 sentences).
-
-Rules:
-- Recommend ONLY from the products listed below. NEVER invent, guess, or name products not in the list.
-- Explain WHY each product fits the customer's specific request — reference what they actually said.
-- Be warm and conversational, not robotic or pushy.
-- If the customer has items in their basket, be aware of them. Don't re-recommend basket items.
-- If there's an upsell item listed, mention it naturally with social proof ("Most people also grab a...").
-- If this is a follow-up, acknowledge the context ("Since you wanted something cheaper..." etc).
-- Do not use markdown formatting. Plain text only.
-- Do not mention internal scores, rankings, or algorithms."""
-
 CLARIFICATION_SYSTEM = """You are a friendly shop assistant. The customer's request is vague.
 Generate ONE short, natural clarification question (1 sentence max) to help narrow down what they want.
 
@@ -119,8 +150,57 @@ Rules:
 
 
 # ---------------------------------------------------------------------------
+# Product catalog formatting
+# ---------------------------------------------------------------------------
+
+def format_product_catalog(products: list[dict]) -> str:
+    """Format the product list into a compact text representation for the LLM prompt."""
+    lines = []
+    for p in products:
+        dietary = ", ".join(p.get("dietary", [])) if p.get("dietary") else "none"
+        allergens = ", ".join(p.get("allergens", [])) if p.get("allergens") else "none"
+        tags = ", ".join(p.get("tags", []))
+        taste = ", ".join(p.get("taste_profile", []))
+        upsell_ids = [u["product_id"] for u in p.get("upsell_pairs", [])]
+        upsell_str = ", ".join(upsell_ids) if upsell_ids else "none"
+
+        lines.append(
+            f'- id:{p["id"]} | {p["name"]} | £{p["price"]:.2f} | '
+            f'cat:{p["category"]} | tags:[{tags}] | dietary:[{dietary}] | '
+            f'allergens:[{allergens}] | taste:[{taste}] | '
+            f'size:{p.get("portion_size","?")} | cal:{p.get("calories_band","?")} | '
+            f'prep:{p.get("prep_time_minutes","?")}min | upsells:[{upsell_str}]'
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
+
+def build_recommend_prompt(
+    user_message: str,
+    products: list[dict],
+    basket: list[dict] | None = None,
+    history: list[dict] | None = None,
+) -> str:
+    """Build the user prompt for the recommendation call, including full product catalog."""
+    catalog = format_product_catalog(products)
+    prompt = f'Customer said: "{user_message}"'
+
+    if history:
+        recent = history[-6:]
+        convo_lines = [f"  {m['role'].title()}: {m['content'][:150]}" for m in recent]
+        prompt += "\n\nConversation history:\n" + "\n".join(convo_lines)
+
+    prompt += f"\n\n--- PRODUCT CATALOG ({len(products)} items) ---\n{catalog}"
+
+    if basket:
+        basket_lines = [f"  - {item['name']} (id:{item['id']})" for item in basket]
+        prompt += "\n\n--- ALREADY IN BASKET (do not recommend these) ---\n" + "\n".join(basket_lines)
+
+    return prompt
+
 
 def _build_intent_messages(
     text: str,
@@ -131,7 +211,6 @@ def _build_intent_messages(
     messages = [{"role": "system", "content": INTENT_EXTRACTION_SYSTEM}]
 
     if history:
-        # Include last few turns as context (keep it short)
         for msg in history[-6:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
 
@@ -141,49 +220,6 @@ def _build_intent_messages(
 
     messages.append({"role": "user", "content": user_content})
     return messages
-
-
-def _build_response_user_prompt(
-    user_message: str,
-    products: list[dict],
-    upsell: dict | None = None,
-    basket: list[dict] | None = None,
-    history: list[dict] | None = None,
-) -> str:
-    product_lines = []
-    for i, p in enumerate(products, 1):
-        tags = ", ".join(p.get("tags", [])[:3])
-        dietary = ", ".join(p.get("dietary", [])) if p.get("dietary") else ""
-        detail = f"{tags}"
-        if dietary:
-            detail += f", {dietary}"
-        product_lines.append(
-            f"{i}. {p['name']} — £{p['price']:.2f} ({detail})"
-        )
-
-    prompt = f'Customer said: "{user_message}"'
-
-    if history:
-        recent = history[-4:]
-        convo_lines = [f"  {m['role'].title()}: {m['content'][:120]}" for m in recent]
-        prompt += f"\n\nConversation context:\n" + "\n".join(convo_lines)
-
-    prompt += f"""
-
-Recommended products (ONLY mention these by name):
-{chr(10).join(product_lines)}"""
-
-    if basket:
-        basket_names = [item["name"] for item in basket]
-        prompt += f"\n\nAlready in basket: {', '.join(basket_names)}"
-
-    if upsell:
-        prompt += f"""
-
-Upsell suggestion (mention naturally if appropriate):
-- {upsell['name']} — £{upsell['price']:.2f}"""
-
-    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +247,50 @@ def validate_intent(raw: dict) -> dict:
     validated["behaviour"] = beh if beh in VALID_BEHAVIOURS else "exploring"
 
     return validated
+
+
+def validate_recommendation(raw: dict, valid_ids: set[str]) -> dict | None:
+    """Validate LLM recommendation output. Returns sanitised dict or None."""
+    if not isinstance(raw, dict):
+        logger.warning("LLM recommendation is not a dict")
+        return None
+
+    rec_ids = raw.get("recommended_ids", [])
+    if not isinstance(rec_ids, list):
+        logger.warning("recommended_ids is not a list")
+        return None
+
+    # Strip any IDs not in the real catalog
+    valid_rec_ids = [pid for pid in rec_ids if pid in valid_ids]
+    if not valid_rec_ids:
+        logger.warning("LLM recommended zero valid products (raw: %s)", rec_ids)
+        return None
+
+    if len(valid_rec_ids) != len(rec_ids):
+        stripped = set(rec_ids) - set(valid_rec_ids)
+        logger.warning("Stripped hallucinated product IDs: %s", stripped)
+
+    # Validate message
+    message = raw.get("message", "")
+    if not message or len(message) < 10:
+        message = None
+    elif len(message) > 800:
+        message = message[:800].rsplit(".", 1)[0] + "."
+
+    # Validate clarification
+    clarification = None
+    if raw.get("needs_clarification"):
+        q = raw.get("clarification_question", "")
+        if q and 10 <= len(q) <= 200:
+            clarification = q if "?" in q else q + "?"
+
+    return {
+        "recommended_ids": valid_rec_ids[:3],
+        "reasoning": raw.get("reasoning", ""),
+        "message": message,
+        "needs_clarification": bool(clarification),
+        "clarification_question": clarification,
+    }
 
 
 def validate_response_text(
@@ -277,6 +357,41 @@ def _call_llm(messages: list[dict], temperature: float = 0.7, max_tokens: int = 
 # LLM calls
 # ---------------------------------------------------------------------------
 
+def recommend_from_catalog(
+    user_message: str,
+    products: list[dict],
+    basket: list[dict] | None = None,
+    history: list[dict] | None = None,
+) -> dict | None:
+    """Main LLM call: receives the product catalog, picks products, and explains why.
+
+    Returns validated dict with recommended_ids, message, reasoning, and optional
+    clarification — or None on failure (triggers deterministic fallback).
+    """
+    user_prompt = build_recommend_prompt(user_message, products, basket, history)
+
+    messages = [
+        {"role": "system", "content": RECOMMEND_SYSTEM},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    raw = _call_llm(messages, temperature=0.5, max_tokens=500)
+    if raw is None:
+        return None
+
+    try:
+        raw = _strip_code_fences(raw)
+        parsed = json.loads(raw)
+        valid_ids = {p["id"] for p in products}
+        result = validate_recommendation(parsed, valid_ids)
+        if result:
+            logger.info("LLM recommended: %s", result["recommended_ids"])
+        return result
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.error("LLM recommendation parsing failed: %s — raw: %s", e, raw[:300])
+        return None
+
+
 def extract_intent_llm(
     text: str,
     history: list[dict] | None = None,
@@ -315,29 +430,3 @@ def generate_clarification_llm(
 
     raw = _call_llm(messages, temperature=0.8, max_tokens=80)
     return validate_clarification(raw)
-
-
-def generate_response_llm(
-    user_message: str,
-    products: list[dict],
-    upsell: dict | None = None,
-    basket: list[dict] | None = None,
-    history: list[dict] | None = None,
-) -> str | None:
-    """Generate a natural recommendation response with product reasoning.
-
-    Includes basket awareness, upsell phrasing, and conversation context.
-    Returns validated response string on success, None on failure.
-    """
-    user_prompt = _build_response_user_prompt(
-        user_message, products, upsell, basket, history
-    )
-
-    messages = [
-        {"role": "system", "content": RESPONSE_GENERATION_SYSTEM},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    raw = _call_llm(messages, temperature=0.7, max_tokens=300)
-    product_names = [p["name"] for p in products]
-    return validate_response_text(raw, product_names)

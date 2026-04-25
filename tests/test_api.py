@@ -391,3 +391,73 @@ class TestValidation:
         from llm.openai_client import validate_clarification
         result = validate_clarification("Would you like something sweet or savoury")
         assert result.endswith("?")
+
+    def test_validate_recommendation_strips_hallucinated_ids(self):
+        from llm.openai_client import validate_recommendation
+        valid_ids = {"cafe_001", "cafe_002", "cafe_003"}
+        raw = {
+            "recommended_ids": ["cafe_001", "FAKE_999", "cafe_002"],
+            "reasoning": "Good picks",
+            "message": "I'd recommend the wrap and the sandwich.",
+            "needs_clarification": False,
+        }
+        result = validate_recommendation(raw, valid_ids)
+        assert result is not None
+        assert result["recommended_ids"] == ["cafe_001", "cafe_002"]
+        assert "FAKE_999" not in result["recommended_ids"]
+
+    def test_validate_recommendation_rejects_all_hallucinated(self):
+        from llm.openai_client import validate_recommendation
+        valid_ids = {"cafe_001", "cafe_002"}
+        raw = {
+            "recommended_ids": ["FAKE_001", "FAKE_002"],
+            "reasoning": "Made up products",
+            "message": "Here are some options.",
+        }
+        result = validate_recommendation(raw, valid_ids)
+        assert result is None
+
+    def test_validate_recommendation_limits_to_three(self):
+        from llm.openai_client import validate_recommendation
+        valid_ids = {"cafe_001", "cafe_002", "cafe_003", "cafe_004", "cafe_005"}
+        raw = {
+            "recommended_ids": ["cafe_001", "cafe_002", "cafe_003", "cafe_004", "cafe_005"],
+            "reasoning": "All five",
+            "message": "Here are five products for you.",
+        }
+        result = validate_recommendation(raw, valid_ids)
+        assert result is not None
+        assert len(result["recommended_ids"]) == 3
+
+    def test_validate_recommendation_clarification(self):
+        from llm.openai_client import validate_recommendation
+        valid_ids = {"cafe_001"}
+        raw = {
+            "recommended_ids": [],
+            "reasoning": "",
+            "message": "",
+            "needs_clarification": True,
+            "clarification_question": "Are you looking for breakfast or lunch?",
+        }
+        # No valid product IDs → returns None (clarification handled differently)
+        result = validate_recommendation(raw, valid_ids)
+        assert result is None
+
+    def test_format_product_catalog(self):
+        from llm.openai_client import format_product_catalog
+        products = [
+            {
+                "id": "test_001", "name": "Test Product", "price": 5.00,
+                "category": "lunch", "tags": ["quick", "light"],
+                "dietary": ["vegan"], "allergens": ["gluten"],
+                "taste_profile": ["savory"], "portion_size": "medium",
+                "calories_band": "300-400", "prep_time_minutes": 3,
+                "upsell_pairs": [{"product_id": "test_002", "type": "drink"}],
+            }
+        ]
+        catalog = format_product_catalog(products)
+        assert "test_001" in catalog
+        assert "Test Product" in catalog
+        assert "£5.00" in catalog
+        assert "vegan" in catalog
+        assert "test_002" in catalog

@@ -7,10 +7,10 @@ An AI-powered shopping assistant that recommends products through guided convers
 ## Architecture
 
 - **Backend**: Python + FastAPI — hybrid LLM + deterministic engine
-- **LLM Layer**: OpenAI GPT-4o-mini — multi-turn intent extraction, contextual clarification, product reasoning, basket-aware responses
+- **LLM Layer**: OpenAI GPT-4o-mini — receives full product catalog, picks products, explains reasoning, handles multi-turn conversation
 - **Decision Engine**: Deterministic — filtering, weighted ranking, upsell selection (no LLM involved)
 - **Frontend**: Vue 3 + Tailwind CSS — dark-themed guided shopping flow with AI reasoning panel
-- **Data**: 60+ products across 4 store types with intent signals, dietary info, and business metrics
+- **Data**: 71 products across 4 store types with intent signals, dietary info, and business metrics
 
 ## Quick Start
 
@@ -37,22 +37,21 @@ npm run dev
 ### Tests
 
 ```bash
-uv run pytest tests/ -v   # 36 tests
+uv run pytest tests/ -v   # 41 tests
 ```
 
 ## How It Works
 
 1. Customer picks a store type and states what they want (chips or free text)
-2. **LLM** extracts structured intent from free text, with multi-turn awareness (or keyword fallback)
-3. If request is vague, **LLM** generates a contextual clarification question
-4. **Deterministic engine** filters by store → category → dietary, then ranks by weighted scoring
-5. **Deterministic engine** selects top N products (N adapts to behaviour: 1 for rushed, 3 for browsing)
-6. **Deterministic engine** picks a complementary upsell from curated pairs
-7. **LLM** generates a basket-aware response with per-product reasoning and natural upsell phrasing
-8. Customer can refine, pivot, or follow up (up to 4 turns)
-9. All LLM outputs are validated — hallucinated values are stripped before they reach the UI
+2. Backend sends the **full product catalog** (store-filtered) to the LLM along with the user's message
+3. **LLM browses the catalog**, picks 1-3 best-matching products, and explains its reasoning
+4. **Validation layer** checks every product ID the LLM returns exists in the real catalog — hallucinated products are stripped
+5. **Deterministic engine** picks a complementary upsell from curated product pairs
+6. **LLM** writes a natural, basket-aware response with per-product reasoning
+7. Customer can refine, pivot, or follow up (up to 4 turns)
+8. If LLM is unavailable → **deterministic fallback** (keyword matching + weighted scoring)
 
-> The LLM never chooses, ranks, or invents products. It only understands and speaks.
+> The LLM recommends from real product data. Every recommendation is validated against the catalog.
 
 ## Project Structure
 
@@ -61,19 +60,18 @@ api/          FastAPI endpoints (recommend, upsell, classify-intent, chat)
 engine/       Deterministic: intent extraction, filtering, ranking, upsell
 llm/          OpenAI integration: intent extraction + response generation
 models/       Pydantic schemas (Product, Intent, API models)
-data/         Product catalog (60+ items, 4 store types)
+data/         Product catalog (71 items, 4 store types)
 frontend/     Vue 3 + Tailwind CSS app with AI reasoning panel
-tests/        36 automated tests (API, chat multi-turn, validation)
+tests/        41 automated tests (API, chat, validation, catalog formatting)
 ```
 
 ## Key Design Decisions
 
-- **Hybrid architecture** — LLM for understanding + speaking, deterministic engine for all decisions
-- **LLM never picks products** — the engine decides what, the LLM decides how to say it
+- **LLM-first architecture** — LLM receives product catalog, picks products, and explains reasoning
+- **Validated recommendations** — every product ID the LLM returns is checked against the real catalog
 - **Multi-turn conversation** — up to 4 turns: refine, pivot, or explore alternatives naturally
-- **Validation layer** — every LLM output is validated against allowed value sets before use
-- **Graceful fallback** — no API key? Demo works with keyword matching and static templates
-- **Prompt transparency** — UI shows exact prompts, model outputs, and decision flow
+- **Deterministic fallback** — no API key? Demo works with keyword matching and weighted scoring
+- **Prompt transparency** — UI shows exact prompts, product catalog sent to model, and decision flow
 - **Basket-aware** — LLM knows what's in the basket and adjusts responses accordingly
 - **Store isolation** — products partitioned by store type at the API layer
 - **Behaviour-adaptive** — rushed users see 1 result, browsers see 3

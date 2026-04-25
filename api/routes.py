@@ -24,12 +24,12 @@ from llm.openai_client import (
     MAX_TURNS,
     extract_intent_llm,
     generate_clarification_llm,
-    generate_response_llm,
+    recommend_from_catalog,
     is_llm_available,
+    RECOMMEND_SYSTEM,
     INTENT_EXTRACTION_SYSTEM,
-    RESPONSE_GENERATION_SYSTEM,
     CLARIFICATION_SYSTEM,
-    _build_response_user_prompt,
+    build_recommend_prompt,
 )
 from models.schemas import Intent, Product
 
@@ -168,55 +168,108 @@ def classify_intent(req: ClassifyRequest):
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    """Multi-turn chat: LLM intent → deterministic ranking → LLM response.
+    """LLM-first chat: pass product catalog to LLM, let it pick + explain.
 
-    Supports follow-ups, pivots, basket awareness, contextual clarification.
-    Falls back to keyword-based logic if LLM is unavailable.
+    The LLM receives the full store catalog and recommends products directly.
+    Falls back to deterministic engine if LLM is unavailable or returns invalid output.
     """
-    products = _filter_by_store(_load_products(), req.store_type)
+    all_products = _load_products()
+    products = _filter_by_store(all_products, req.store_type)
+    product_map = {p.id: p for p in products}
     llm_active = is_llm_available()
     prompts: dict = {}
     history = [{"role": m.role, "content": m.content} for m in req.history]
     turn_count = len([m for m in req.history if m.role == "user"]) + 1
     can_follow_up = turn_count < MAX_TURNS
 
-    # Build previous intent from history (for multi-turn refinement)
-    previous_intent = None
-    if req.history:
-        # Try to re-extract the previous intent from the first user message
-        # This is lightweight — the LLM prompt handles context awareness
-        first_user_msg = next((m.content for m in req.history if m.role == "user"), None)
-        if first_user_msg:
-            prev = extract_intent(first_user_msg)
-            previous_intent = {
-                "category": prev.category,
-                "preferences": prev.preferences,
-                "modifiers": prev.modifiers,
-                "dietary": prev.dietary,
-                "behaviour": prev.behaviour,
+    # Build basket context
+    basket_context = None
+    if req.basket_ids:
+        basket_context = [
+            {"name": product_map[bid].name, "id": bid, "price": product_map[bid].price}
+            for bid in req.basket_ids if bid in product_map
+        ]
+
+    # Convert products to dicts for LLM
+    product_dicts = [_product_to_dict(p) for p in products]
+
+    # ===================================================================
+    # LLM PATH: Send full catalog, let LLM pick products + write response
+    # ===================================================================
+    if llm_active:
+        llm_result = recommend_from_catalog(
+            req.message, product_dicts, basket_context, history
+        )
+
+        if llm_result is not None:
+            # Record prompt transparency
+            user_prompt = build_recommend_prompt(
+                req.message, product_dicts, basket_context, history
+            )
+            prompts["recommendation"] = {
+                "system": RECOMMEND_SYSTEM,
+                "user": user_prompt,
+                "model_output": {
+                    "recommended_ids": llm_result["recommended_ids"],
+                    "reasoning": llm_result["reasoning"],
+                    "message": llm_result["message"],
+                    "needs_clarification": llm_result["needs_clarification"],
+                },
             }
 
-    # --- Step 1: Intent extraction (LLM with history, or fallback) ---
-    llm_intent = None
-    if llm_active:
-        llm_intent = extract_intent_llm(req.message, history, previous_intent)
+            # Handle clarification from LLM
+            if llm_result["needs_clarification"] and llm_result["clarification_question"]:
+                return ChatResponse(
+                    products=[],
+                    clarification=llm_result["clarification_question"],
+                    llm_used=True,
+                    prompts=prompts,
+                    can_follow_up=True,
+                    turn_count=turn_count,
+                )
 
-    if llm_intent is not None:
-        intent = Intent(
-            category=llm_intent.get("category") if llm_intent.get("category") != "unknown" else None,
-            preferences=llm_intent.get("preferences", []),
-            modifiers=llm_intent.get("modifiers", []),
-            dietary=llm_intent.get("dietary", []),
-            behaviour=llm_intent.get("behaviour", "exploring"),
-        )
-        prompts["intent_extraction"] = {
-            "system": INTENT_EXTRACTION_SYSTEM,
-            "user": req.message,
-            "model_output": llm_intent,
-        }
-    else:
-        intent = extract_intent(req.message)
+            # Build product outputs from LLM-selected IDs
+            rec_products = [product_map[pid] for pid in llm_result["recommended_ids"] if pid in product_map]
+            product_outs = [_product_to_out(p) for p in rec_products]
 
+            # Upsell: deterministic selection from the first recommended product
+            upsell_out = None
+            upsell_msg = ""
+            if rec_products:
+                basket_set = set(req.basket_ids)
+                upsell_product = get_upsell(rec_products[0], list(product_map.values()), basket_set)
+                if upsell_product:
+                    upsell_out = _product_to_out(upsell_product)
+                    upsell_msg = f"Most people pair this with a {upsell_product.name}"
+
+            # Extract intent for transparency (lightweight, parallel to LLM)
+            intent = extract_intent(req.message)
+            intent_response = ClassifyResponse(
+                category=intent.category,
+                preferences=intent.preferences,
+                modifiers=intent.modifiers,
+                dietary=intent.dietary,
+                behaviour=intent.behaviour,
+            )
+
+            ai_msg = llm_result["message"] or _static_message([p.name for p in rec_products])
+
+            return ChatResponse(
+                products=product_outs,
+                ai_message=ai_msg,
+                upsell=upsell_out,
+                upsell_message=upsell_msg,
+                intent_used=intent_response,
+                llm_used=True,
+                prompts=prompts,
+                can_follow_up=can_follow_up,
+                turn_count=turn_count,
+            )
+
+    # ===================================================================
+    # FALLBACK PATH: Deterministic engine (no LLM or LLM failed)
+    # ===================================================================
+    intent = extract_intent(req.message)
     intent_response = ClassifyResponse(
         category=intent.category,
         preferences=intent.preferences,
@@ -225,28 +278,13 @@ def chat(req: ChatRequest):
         behaviour=intent.behaviour,
     )
 
-    # --- Step 2: Contextual clarification (LLM or hardcoded fallback) ---
-    needs_clarification = (
-        not intent.preferences
-        and not intent.modifiers
-        and not intent.dietary
-        and (intent.category is None or intent.category in CLARIFICATION_MAP)
-        and turn_count == 1  # Only clarify on first turn
-    )
-
-    if needs_clarification:
-        clarification = None
-        if llm_active:
-            clarification = generate_clarification_llm(req.message, history)
-            if clarification:
-                prompts["clarification"] = {
-                    "system": CLARIFICATION_SYSTEM,
-                    "user": req.message,
-                    "model_output": clarification,
-                }
-        if clarification is None and intent.category:
-            clarification = CLARIFICATION_MAP.get(intent.category)
-
+    # Clarification check (first turn, bare intent)
+    if (
+        not intent.preferences and not intent.modifiers and not intent.dietary
+        and intent.category and intent.category in CLARIFICATION_MAP
+        and turn_count == 1
+    ):
+        clarification = CLARIFICATION_MAP.get(intent.category)
         if clarification:
             filtered = filter_products(products, intent)
             recs = get_top_recommendations(filtered, intent) if filtered else []
@@ -255,21 +293,20 @@ def chat(req: ChatRequest):
                 products=product_outs,
                 clarification=clarification,
                 intent_used=intent_response,
-                llm_used=llm_intent is not None,
+                llm_used=False,
                 prompts=prompts,
                 can_follow_up=True,
                 turn_count=turn_count,
             )
 
-    # --- Step 3: Deterministic filtering + ranking ---
+    # Deterministic filtering + ranking
     filtered = filter_products(products, intent)
     if not filtered:
-        ai_msg = "I couldn't find an exact match for that. Could you tell me a bit more about what you're looking for?"
         return ChatResponse(
             products=[],
-            ai_message=ai_msg,
+            ai_message="I couldn't find an exact match for that. Could you tell me a bit more about what you're looking for?",
             intent_used=intent_response,
-            llm_used=llm_intent is not None,
+            llm_used=False,
             prompts=prompts,
             can_follow_up=can_follow_up,
             turn_count=turn_count,
@@ -278,51 +315,17 @@ def chat(req: ChatRequest):
     recs = get_top_recommendations(filtered, intent)
     product_outs = [_product_to_out(p, intent) for p in recs]
 
-    # --- Step 4: Upsell (deterministic selection, LLM phrasing) ---
+    # Upsell
     upsell_out = None
     upsell_msg = ""
     if recs:
         basket_set = set(req.basket_ids)
-        upsell_product = get_upsell(recs[0], products, basket_set)
+        upsell_product = get_upsell(recs[0], list(product_map.values()), basket_set)
         if upsell_product:
             upsell_out = _product_to_out(upsell_product)
             upsell_msg = f"Most people pair this with a {upsell_product.name}"
 
-    # --- Step 5: LLM response (with product reasoning, basket, history) ---
-    product_dicts = [p.model_dump() for p in product_outs]
-    upsell_dict = upsell_out.model_dump() if upsell_out else None
-
-    # Build basket context for the LLM
-    basket_context = None
-    if req.basket_ids:
-        product_map = {p.id: p for p in products}
-        basket_context = [
-            {"name": product_map[bid].name, "price": product_map[bid].price}
-            for bid in req.basket_ids if bid in product_map
-        ]
-
-    ai_msg = None
-    if llm_active:
-        ai_msg = generate_response_llm(
-            req.message, product_dicts, upsell_dict, basket_context, history
-        )
-        if ai_msg:
-            response_user_prompt = _build_response_user_prompt(
-                req.message, product_dicts, upsell_dict, basket_context, history
-            )
-            prompts["response_generation"] = {
-                "system": RESPONSE_GENERATION_SYSTEM,
-                "user": response_user_prompt,
-                "model_output": ai_msg,
-            }
-
-    if ai_msg is None:
-        # Static fallback
-        names = [p.name for p in product_outs]
-        if len(names) == 1:
-            ai_msg = f"I'd recommend the {names[0]} — it's a great fit for what you described."
-        else:
-            ai_msg = f"Based on what you're looking for, I'd suggest the {', '.join(names[:-1])} or the {names[-1]}."
+    ai_msg = _static_message([p.name for p in product_outs])
 
     return ChatResponse(
         products=product_outs,
@@ -330,8 +333,37 @@ def chat(req: ChatRequest):
         upsell=upsell_out,
         upsell_message=upsell_msg,
         intent_used=intent_response,
-        llm_used=llm_intent is not None,
+        llm_used=False,
         prompts=prompts,
         can_follow_up=can_follow_up,
         turn_count=turn_count,
     )
+
+
+def _product_to_dict(p: Product) -> dict:
+    """Convert a Product schema to a dict suitable for the LLM prompt."""
+    return {
+        "id": p.id,
+        "name": p.name,
+        "store_type": p.store_type,
+        "category": p.category,
+        "sub_category": p.sub_category,
+        "price": p.price,
+        "tags": p.tags,
+        "dietary": p.dietary,
+        "allergens": p.allergens,
+        "taste_profile": p.taste_profile,
+        "portion_size": p.portion_size,
+        "calories_band": p.calories_band,
+        "prep_time_minutes": p.prep_time_minutes,
+        "upsell_pairs": [{"product_id": u.product_id, "type": u.type} for u in p.upsell_pairs],
+    }
+
+
+def _static_message(names: list[str]) -> str:
+    """Build a static fallback message from product names."""
+    if not names:
+        return "I couldn't find an exact match. Could you tell me more about what you're looking for?"
+    if len(names) == 1:
+        return f"I'd recommend the {names[0]} — it's a great fit for what you described."
+    return f"Based on what you're looking for, I'd suggest the {', '.join(names[:-1])} or the {names[-1]}."
