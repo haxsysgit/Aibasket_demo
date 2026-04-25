@@ -185,8 +185,10 @@ The UI mirrors the Strivonex brand: slate-950 backgrounds, fuchsia-to-cyan gradi
 │   ├── basket-builder.nginx   # nginx reverse proxy config
 │   └── expose-tunnel.sh      # Cloudflare tunnel for public access
 │
-├── netlify.toml              # Static deploy config
-└── pyproject.toml            # Python dependencies (uv)
+├── render.yaml               # Render deployment blueprint
+├── build.sh                  # Build script (Python deps + Vue frontend)
+├── requirements.txt          # Python dependencies for Render
+└── pyproject.toml            # Python dependencies (uv, local dev)
 ```
 
 ---
@@ -322,17 +324,25 @@ uv run pytest tests/ -v   # 21 passed
 
 ---
 
-## 9. Deployment Options
+## 9. Deployment
 
-### Static (Netlify)
+### Render (Live Demo)
 
-For demos where no server is needed. The `engine.js` file replicates all backend logic client-side. Products are bundled into the JS build. Deployed at `https://ai-basket-builder.netlify.app`.
+The app runs as a single Render web service. FastAPI serves both the API and the built Vue frontend from `frontend/dist/`. The LLM features work because the backend makes server-side OpenAI calls.
 
-Trade-off: all logic and data are exposed in the browser. Fine for a demo, not for production.
+Live at: `https://ai-basket-builder.onrender.com`
+
+**How it works:**
+- `render.yaml` defines the service blueprint
+- `build.sh` installs Python deps and builds the Vue frontend
+- `uvicorn api.main:app` starts the server
+- `OPENAI_API_KEY` is set as an environment variable in Render's dashboard
+
+The free tier sleeps after 15 minutes of inactivity. A loading screen is shown while the server wakes up on first visit.
 
 ### Self-Hosted (Ubuntu + nginx)
 
-The proper architecture. nginx serves the static frontend and proxies `/api/*` to FastAPI running on port 8000 via systemd.
+For a more permanent setup. nginx serves the static frontend and proxies `/api/*` to FastAPI running on port 8000 via systemd.
 
 ```bash
 bash deploy/setup.sh           # Install everything

@@ -2,7 +2,7 @@
 
 An AI-powered shopping assistant that recommends products through guided conversation. Supports multiple store types (café, pub, bakery, corner shop) with adaptive recommendations, single-question clarification, and complementary upsells.
 
-**Live demo**: [ai-basket-builder.netlify.app](https://ai-basket-builder.netlify.app)
+**Live demo**: [ai-basket-builder.onrender.com](https://ai-basket-builder.onrender.com)
 
 ## Architecture
 
