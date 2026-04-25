@@ -4,10 +4,49 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
+    <title>AI Basket Builder</title>
+    <style>
+      body { margin: 0; background: #020617; }
+      #warmup-loader {
+        position: fixed; inset: 0; z-index: 9999;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        background: #020617; color: #e2e8f0;
+        font-family: system-ui, -apple-system, sans-serif;
+        transition: opacity 0.4s;
+      }
+      #warmup-loader.fade-out { opacity: 0; pointer-events: none; }
+      .loader-spinner {
+        width: 40px; height: 40px;
+        border: 3px solid #1e1b4b; border-top-color: #d946ef;
+        border-radius: 50%; animation: spin 0.8s linear infinite;
+      }
+      .loader-text { margin-top: 20px; font-size: 14px; color: #94a3b8; }
+      .loader-sub { margin-top: 8px; font-size: 11px; color: #475569; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
   </head>
   <body>
+    <div id="warmup-loader">
+      <div class="loader-spinner"></div>
+      <div class="loader-text">Starting AI Basket Builder...</div>
+      <div class="loader-sub">Waking up the server — takes a few seconds on first visit</div>
+    </div>
     <div id="app"></div>
     <script type="module" src="/src/main.js"></script>
+    <script>
+      // Dismiss loader once Vue app mounts and backend responds
+      async function waitForApp() {
+        // Wait for Vue to mount
+        const start = Date.now()
+        while (!document.querySelector('#app [data-v-app]') && !document.querySelector('#app > *:not(script)')) {
+          if (Date.now() - start > 30000) break
+          await new Promise(r => setTimeout(r, 200))
+        }
+        const loader = document.getElementById('warmup-loader')
+        if (loader) { loader.classList.add('fade-out'); setTimeout(() => loader.remove(), 500) }
+      }
+      waitForApp()
+    </script>
   </body>
 </html>
