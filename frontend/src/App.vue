@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
-import { classifyIntent, getRecommendations, getUpsell } from './api.js'
+import { classifyIntent, getRecommendations, getUpsell, chat } from './api.js'
 import IntentSelector from './components/IntentSelector.vue'
 import ClarificationStep from './components/ClarificationStep.vue'
 import ProductCards from './components/ProductCards.vue'
@@ -40,6 +40,12 @@ const clarificationOptions = ref([])
 const upsellProducts = ref([])
 const upsellMessage = ref('')
 
+// AI state
+const aiMessage = ref('')
+const aiPrompts = ref({})
+const aiLlmUsed = ref(false)
+const showReasoning = ref(false)
+
 // Basket
 const basket = ref([])
 const basketIds = computed(() => basket.value.map(i => i.id))
@@ -77,14 +83,46 @@ async function handleChipSelect(chip) {
 async function handleCustomInput(text) {
   loading.value = true
   stage.value = 'loading'
+  aiMessage.value = ''
+  aiPrompts.value = {}
+  aiLlmUsed.value = false
+
   try {
-    const intent = await classifyIntent(text, storeType.value)
-    currentIntent.value = intent.category
-    currentPrefs.value = intent.preferences
-    currentMods.value = intent.modifiers
-    currentDietary.value = intent.dietary
-    currentBehaviour.value = intent.behaviour
-    await fetchRecommendations()
+    const data = await chat(text, storeType.value, basketIds.value)
+
+    // Store AI state
+    aiMessage.value = data.ai_message || ''
+    aiPrompts.value = data.prompts || {}
+    aiLlmUsed.value = data.llm_used || false
+
+    // Store intent
+    if (data.intent_used) {
+      currentIntent.value = data.intent_used.category
+      currentPrefs.value = data.intent_used.preferences || []
+      currentMods.value = data.intent_used.modifiers || []
+      currentDietary.value = data.intent_used.dietary || []
+      currentBehaviour.value = data.intent_used.behaviour || 'exploring'
+    }
+
+    // Handle clarification
+    if (data.clarification) {
+      recommendations.value = data.products || []
+      clarification.value = data.clarification
+      clarificationOptions.value = buildClarificationOptions(data.clarification)
+      stage.value = 'clarifying'
+      return
+    }
+
+    // Handle recommendations
+    recommendations.value = data.products || []
+
+    // Handle upsell from chat response
+    if (data.upsell) {
+      upsellProducts.value = [data.upsell]
+      upsellMessage.value = data.upsell_message || ''
+    }
+
+    stage.value = 'results'
   } catch {
     stage.value = 'intent'
   } finally {
@@ -207,6 +245,10 @@ function restart() {
   currentMods.value = []
   currentDietary.value = []
   currentBehaviour.value = 'exploring'
+  aiMessage.value = ''
+  aiPrompts.value = {}
+  aiLlmUsed.value = false
+  showReasoning.value = false
 }
 </script>
 
@@ -268,7 +310,65 @@ function restart() {
         </div>
 
         <!-- Results -->
-        <div v-else-if="stage === 'results'" class="py-6">
+        <div v-else-if="stage === 'results'" class="py-6 space-y-4">
+          <!-- AI Message -->
+          <div v-if="aiMessage" class="bg-slate-800/60 border border-slate-700 rounded-xl p-4 mb-2">
+            <div class="flex items-start gap-3">
+              <span class="text-lg mt-0.5">{{ aiLlmUsed ? '🤖' : '💡' }}</span>
+              <div>
+                <p class="text-slate-200 text-sm leading-relaxed">{{ aiMessage }}</p>
+                <div class="flex items-center gap-3 mt-2">
+                  <span v-if="aiLlmUsed" class="text-[10px] px-2 py-0.5 rounded-full bg-fuchsia-500/20 text-fuchsia-300 font-medium">GPT-4o-mini</span>
+                  <span v-else class="text-[10px] px-2 py-0.5 rounded-full bg-slate-600/40 text-slate-400 font-medium">Deterministic</span>
+                  <button
+                    v-if="Object.keys(aiPrompts).length > 0"
+                    @click="showReasoning = !showReasoning"
+                    class="text-[10px] text-slate-500 hover:text-fuchsia-400 transition-colors cursor-pointer underline"
+                  >
+                    {{ showReasoning ? 'Hide' : 'Show' }} AI reasoning
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- AI Reasoning Panel -->
+          <div v-if="showReasoning && Object.keys(aiPrompts).length > 0"
+               class="bg-slate-900/80 border border-slate-700/50 rounded-xl p-4 text-xs font-mono space-y-4 overflow-x-auto">
+            <h4 class="text-fuchsia-400 text-xs font-bold uppercase tracking-wider mb-2">Prompt Transparency</h4>
+
+            <!-- Intent Extraction -->
+            <div v-if="aiPrompts.intent_extraction" class="space-y-1">
+              <p class="text-cyan-400 font-semibold">1. Intent Extraction</p>
+              <p class="text-slate-500">System prompt:</p>
+              <pre class="text-slate-400 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-32 overflow-y-auto">{{ aiPrompts.intent_extraction.system }}</pre>
+              <p class="text-slate-500">User input:</p>
+              <pre class="text-slate-300 bg-slate-800/50 rounded p-2">"{{ aiPrompts.intent_extraction.user }}"</pre>
+              <p class="text-slate-500">Model output:</p>
+              <pre class="text-green-400 bg-slate-800/50 rounded p-2">{{ JSON.stringify(aiPrompts.intent_extraction.model_output, null, 2) }}</pre>
+            </div>
+
+            <!-- Response Generation -->
+            <div v-if="aiPrompts.response_generation" class="space-y-1">
+              <p class="text-cyan-400 font-semibold">2. Response Generation</p>
+              <p class="text-slate-500">System prompt:</p>
+              <pre class="text-slate-400 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-32 overflow-y-auto">{{ aiPrompts.response_generation.system }}</pre>
+              <p class="text-slate-500">Context sent to model:</p>
+              <pre class="text-slate-300 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-40 overflow-y-auto">{{ aiPrompts.response_generation.user }}</pre>
+              <p class="text-slate-500">Model output:</p>
+              <pre class="text-green-400 whitespace-pre-wrap bg-slate-800/50 rounded p-2">"{{ aiPrompts.response_generation.model_output }}"</pre>
+            </div>
+
+            <!-- Decision flow -->
+            <div class="border-t border-slate-700/50 pt-3 text-slate-500">
+              <p class="font-semibold text-slate-400 mb-1">Decision flow:</p>
+              <p>1. LLM extracts structured intent from free text → <span class="text-cyan-400">{{ aiLlmUsed ? 'GPT-4o-mini' : 'keyword fallback' }}</span></p>
+              <p>2. Deterministic engine filters + ranks products → <span class="text-cyan-400">weighted scoring</span></p>
+              <p>3. Deterministic engine selects upsell → <span class="text-cyan-400">curated pairs</span></p>
+              <p>4. LLM phrases the response naturally → <span class="text-cyan-400">{{ aiLlmUsed ? 'GPT-4o-mini' : 'static template' }}</span></p>
+            </div>
+          </div>
+
           <ProductCards
             :products="recommendations"
             @add="handleAddProduct"
@@ -330,7 +430,7 @@ function restart() {
 
     <!-- Footer -->
     <footer class="border-t border-slate-800 mt-16 py-6 text-center">
-      <p class="text-xs text-slate-600">AI Basket Builder — Prototype Demo · Not a real shop · Logic is deterministic, not LLM</p>
+      <p class="text-xs text-slate-600">AI Basket Builder — Prototype Demo · Not a real shop · Hybrid: LLM understanding + deterministic decisions</p>
     </footer>
   </div>
 </template>

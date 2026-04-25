@@ -51,3 +51,20 @@ class ClassifyResponse(BaseModel):
     modifiers: list[str] = []
     dietary: list[str] = []
     behaviour: str = "exploring"
+
+
+class ChatRequest(BaseModel):
+    message: str
+    store_type: str = "cafe"
+    basket_ids: list[str] = []
+
+
+class ChatResponse(BaseModel):
+    products: list[ProductOut]
+    ai_message: str = ""
+    clarification: str | None = None
+    upsell: ProductOut | None = None
+    upsell_message: str = ""
+    intent_used: ClassifyResponse | None = None
+    llm_used: bool = False
+    prompts: dict = {}

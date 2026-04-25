@@ -6,7 +6,7 @@ A working demo of an AI-powered shopping assistant. A customer tells it what the
 
 It runs across four store types — café, pub, bakery, corner shop — each with its own product catalog. Switch the store dropdown and the entire experience changes: different products, different chips, different upsells.
 
-The backend is a Python FastAPI server. The frontend is Vue 3 with Tailwind CSS. There is no database, no authentication, and no real payment. Every decision the system makes is deterministic — no LLM is involved at runtime.
+The backend is a Python FastAPI server with an optional OpenAI LLM layer. The frontend is Vue 3 with Tailwind CSS. There is no database, no authentication, and no real payment. Every product decision the system makes is deterministic. The LLM handles understanding (intent extraction) and speaking (response generation) — it never picks, ranks, or invents products.
 
 ---
 
@@ -141,15 +141,19 @@ The UI mirrors the Strivonex brand: slate-950 backgrounds, fuchsia-to-cyan gradi
 
 ```
 ├── api/
-│   ├── main.py              # FastAPI app factory
-│   ├── routes.py             # 3 endpoints: recommend, upsell, classify-intent
+│   ├── main.py              # FastAPI app factory, loads .env
+│   ├── routes.py             # 4 endpoints: recommend, upsell, classify-intent, chat
 │   └── models.py             # Pydantic request/response schemas
 │
 ├── engine/
-│   ├── intent.py             # Keyword-based intent extraction
+│   ├── intent.py             # Keyword-based intent extraction (fallback)
 │   ├── filter.py             # Category + dietary filtering
 │   ├── ranker.py             # Weighted scoring and ranking
 │   └── upsell.py             # Complementary product selection
+│
+├── llm/
+│   ├── openai_client.py      # OpenAI: intent extraction + response generation
+│   └── simulated.py          # Static response templates (pre-LLM)
 │
 ├── models/
 │   └── schemas.py            # Core data models (Product, Intent, etc.)
@@ -337,7 +341,60 @@ bash deploy/expose-tunnel.sh   # Get a public URL via Cloudflare Tunnel
 
 ---
 
-## 10. How This Becomes Production
+## 10. LLM Integration Layer
+
+### Where the LLM Is Used
+
+The LLM (GPT-4o-mini) has exactly two jobs:
+
+**1. Intent Extraction** — Turn free text like "something sweet but not too heavy" into structured JSON:
+```json
+{"category": "snack", "preferences": ["sweet", "light"], "modifiers": [], "dietary": [], "behaviour": "exploring"}
+```
+
+**2. Response Generation** — Take the engine's ranked products and phrase them naturally:
+> "I recommend the Chocolate Brownie! It's sweet and indulgent, yet still light enough. Most people also grab a Flat White Coffee."
+
+### Where the LLM Is NOT Used
+
+- Product filtering (deterministic: category + dietary + store type)
+- Product ranking (deterministic: weighted scoring formula)
+- Upsell selection (deterministic: curated pairs sorted by popularity)
+- Clarification questions (deterministic: hardcoded per category)
+
+### Why This Hybrid Approach
+
+A pure LLM approach would let the model choose products. This is dangerous:
+- It can **hallucinate products** that don't exist in the catalog
+- It **ignores business rules** (margin, conversion, popularity)
+- It's **unpredictable** — same input can give different outputs
+- It's **untestable** — you can't write deterministic assertions
+
+The hybrid approach gives you:
+- **Reliability** — the engine always picks valid, well-scored products
+- **Testability** — 21 automated tests verify product decisions
+- **Natural language** — the LLM makes the interaction feel human
+- **Controllability** — business rules are in code, not in prompts
+
+### Prompt Design
+
+Both prompts are exposed in the UI via "Show AI reasoning":
+
+**Intent extraction prompt** constrains the model to a fixed schema with allowed values. Temperature is set to 0.1 for consistency. The model returns JSON only — no explanation, no markdown.
+
+**Response generation prompt** receives only the engine-selected products. The model is told: "Recommend ONLY from the products provided below. Do not invent products." This prevents hallucination structurally — the model can only reference what the engine chose.
+
+### Fallback Behaviour
+
+If `OPENAI_API_KEY` is missing or any API call fails:
+- Intent extraction falls back to keyword matching (`engine/intent.py`)
+- Response generation falls back to static template strings
+- A warning is logged — no error shown to the user
+- The demo works identically, just without LLM phrasing
+
+---
+
+## 11. How This Becomes Production
 
 This demo is a proof of concept. Here's what changes — and what doesn't — when moving to production.
 
@@ -352,7 +409,7 @@ This demo is a proof of concept. Here's what changes — and what doesn't — wh
 | Demo | Production |
 |---|---|
 | `products.json` (60 items) | PostgreSQL or Redis with thousands of products per store |
-| Keyword matching for intent | LLM (GPT-4 / Claude) for natural language understanding |
+| GPT-4o-mini for intent (demo) | Fine-tuned model or GPT-4 for higher accuracy |
 | Static ranking weights | A/B tested weights, updated from conversion data |
 | Hardcoded upsell pairs | ML model trained on purchase history (association rules, collaborative filtering) |
 | No auth | OAuth / API keys per retailer |

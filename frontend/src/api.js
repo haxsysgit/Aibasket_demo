@@ -26,3 +26,12 @@ export async function getUpsell(productId, basketIds, storeType = 'cafe') {
   })
   return res.json()
 }
+
+export async function chat(message, storeType = 'cafe', basketIds = []) {
+  const res = await fetch(`${BASE}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, store_type: storeType, basket_ids: basketIds }),
+  })
+  return res.json()
+}
