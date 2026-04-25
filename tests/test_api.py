@@ -443,6 +443,28 @@ class TestValidation:
         result = validate_recommendation(raw, valid_ids)
         assert result is None
 
+    def test_yaml_prompt_loads_and_renders(self):
+        from llm.openai_client import get_recommend_system_prompt, get_recommend_yaml_raw
+        # Raw YAML template should contain {shop_type} placeholder
+        raw = get_recommend_yaml_raw()
+        assert "{shop_type}" in raw
+        assert "shop_context:" in raw
+
+        # Rendered for cafe should contain "café" and café context
+        rendered = get_recommend_system_prompt("cafe")
+        assert "café" in rendered
+        assert "casual" in rendered.lower()  # café context mentions casual
+
+        # Rendered for pub should contain "pub" and pub context
+        rendered_pub = get_recommend_system_prompt("pub")
+        assert "pub" in rendered_pub
+        assert "hearty" in rendered_pub.lower() or "pint" in rendered_pub.lower()
+
+        # Rendered for corner_shop
+        rendered_cs = get_recommend_system_prompt("corner_shop")
+        assert "corner shop" in rendered_cs
+        assert "convenience" in rendered_cs.lower() or "rush" in rendered_cs.lower()
+
     def test_format_product_catalog(self):
         from llm.openai_client import format_product_catalog
         products = [

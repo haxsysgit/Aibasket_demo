@@ -369,13 +369,19 @@ function restart() {
                class="bg-slate-900/80 border border-slate-700/50 rounded-xl p-4 text-xs font-mono space-y-4 overflow-x-auto">
             <h4 class="text-fuchsia-400 text-xs font-bold uppercase tracking-wider mb-2">Prompt Transparency</h4>
 
-            <!-- LLM Recommendation (product catalog → LLM → picked products) -->
+            <!-- LLM Recommendation (YAML prompt → product catalog → LLM → picked products) -->
             <div v-if="aiPrompts.recommendation" class="space-y-1">
               <p class="text-cyan-400 font-semibold">1. Product Catalog → LLM Recommendation</p>
-              <p class="text-slate-500">System prompt:</p>
-              <pre class="text-slate-400 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-32 overflow-y-auto">{{ aiPrompts.recommendation.system }}</pre>
+
+              <p class="text-slate-500">System prompt YAML template <span class="text-fuchsia-400/60">(prompt.yaml)</span>:</p>
+              <pre class="text-amber-300/80 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-40 overflow-y-auto text-[10px] leading-relaxed">{{ aiPrompts.recommendation.system_yaml_template }}</pre>
+
+              <p class="text-slate-500">Rendered system prompt <span class="text-fuchsia-400/60">(with shop type substituted)</span>:</p>
+              <pre class="text-slate-400 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-32 overflow-y-auto text-[10px] leading-relaxed">{{ aiPrompts.recommendation.system_rendered }}</pre>
+
               <p class="text-slate-500">Product catalog + user message sent to model:</p>
               <pre class="text-slate-300 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-48 overflow-y-auto">{{ aiPrompts.recommendation.user }}</pre>
+
               <p class="text-slate-500">Model output (selected products + reasoning):</p>
               <pre class="text-green-400 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-40 overflow-y-auto">{{ JSON.stringify(aiPrompts.recommendation.model_output, null, 2) }}</pre>
             </div>

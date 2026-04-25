@@ -19,7 +19,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 
+import yaml
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -64,49 +66,61 @@ def is_llm_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Prompts (kept as constants for transparency / display in UI)
+# Prompts — loaded from YAML for structure + dynamic shop_type substitution
 # ---------------------------------------------------------------------------
 
-RECOMMEND_SYSTEM = """You are an AI shopping assistant for a food & drink shop.
-You will receive the full product catalog for this store. Your job is to:
-1. Understand what the customer wants from their message (and conversation history if present)
-2. Browse the product catalog and pick the BEST matching products
-3. Explain your reasoning — why each product fits what the customer asked for
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
-Return ONLY valid JSON, no markdown, no explanation outside the JSON. Schema:
-{
-  "recommended_ids": ["id1", "id2"],  // 1-3 product IDs from the catalog
-  "reasoning": "...",                  // 1-2 sentences: why you picked these
-  "message": "...",                    // 2-4 sentences: friendly response to the customer
-  "needs_clarification": false,        // true if the request is too vague to recommend
-  "clarification_question": null       // if needs_clarification is true, ask ONE short question
-}
+_recommend_yaml_cache: dict | None = None
 
-Product selection rules:
-- Pick 1-3 products. If the customer seems rushed, pick 1. If exploring, pick up to 3.
-- ONLY use product IDs that appear in the catalog below. NEVER invent products.
-- Match on: category, tags, dietary needs, taste, price, portion size, prep time.
-- If the customer has items in their basket, do NOT recommend those again.
-- If you find a relevant upsell_pair on a recommended product, mention it naturally in your message
-  using social proof (e.g. "Most people also grab a..."). Only suggest upsells from the catalog.
 
-Message rules:
-- Be warm and conversational, not robotic.
-- Reference what the customer actually said — show you understood.
-- Mention specific product details (price, dietary info, taste) that are relevant to their request.
-- If this is a follow-up, acknowledge the context ("Since you wanted something lighter...").
-- Do not use markdown formatting. Plain text only.
-- Do not mention scores, algorithms, or internal data.
+def _load_recommend_yaml() -> dict:
+    """Load and cache the recommend prompt YAML."""
+    global _recommend_yaml_cache
+    if _recommend_yaml_cache is not None:
+        return _recommend_yaml_cache
+    yaml_path = PROMPTS_DIR / "recommend.yaml"
+    with open(yaml_path, "r") as f:
+        _recommend_yaml_cache = yaml.safe_load(f)
+    return _recommend_yaml_cache
 
-Multi-turn rules:
-- If the customer REFINES ("something cheaper", "make it vegan"), adjust your picks accordingly.
-- If the customer PIVOTS ("forget that, I want a drink"), start fresh — pick from the new category.
-- Consider conversation history to understand context.
 
-Clarification rules:
-- Only set needs_clarification=true if the request is genuinely too vague (e.g. "food", "anything").
-- If you can make reasonable product picks, do so — don't over-clarify.
-- Keep clarification questions casual and short (1 sentence)."""
+def get_recommend_system_prompt(shop_type: str = "shop") -> str:
+    """Render the recommend system prompt from YAML, substituting {shop_type}.
+
+    The YAML structure is sent as-is (serialized) because LLMs parse structured
+    YAML more reliably than unstructured prose. The shop_type is substituted
+    into the role and the matching shop_context is injected.
+    """
+    prompt_data = _load_recommend_yaml()
+
+    # Map store_type to display name
+    shop_names = {
+        "cafe": "café",
+        "pub": "pub",
+        "bakery": "bakery",
+        "corner_shop": "corner shop",
+    }
+    shop_display = shop_names.get(shop_type, shop_type)
+
+    # Substitute {shop_type} in the role
+    role = prompt_data["role"].replace("{shop_type}", shop_display)
+
+    # Pick the right shop context
+    shop_context = prompt_data.get("shop_context", {}).get(shop_type, "")
+
+    # Build the rendered prompt: YAML structure with resolved values
+    rendered = dict(prompt_data)
+    rendered["role"] = role
+    rendered["shop_context"] = shop_context  # only the relevant one
+
+    return yaml.dump(rendered, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
+def get_recommend_yaml_raw() -> str:
+    """Return the raw YAML template (for prompt transparency display)."""
+    yaml_path = PROMPTS_DIR / "recommend.yaml"
+    return yaml_path.read_text()
 
 INTENT_EXTRACTION_SYSTEM = """You are an intent classifier for a food & drink shop assistant.
 
@@ -183,6 +197,7 @@ def build_recommend_prompt(
     products: list[dict],
     basket: list[dict] | None = None,
     history: list[dict] | None = None,
+    shop_type: str = "shop",
 ) -> str:
     """Build the user prompt for the recommendation call, including full product catalog."""
     catalog = format_product_catalog(products)
@@ -362,16 +377,18 @@ def recommend_from_catalog(
     products: list[dict],
     basket: list[dict] | None = None,
     history: list[dict] | None = None,
+    shop_type: str = "shop",
 ) -> dict | None:
     """Main LLM call: receives the product catalog, picks products, and explains why.
 
     Returns validated dict with recommended_ids, message, reasoning, and optional
     clarification — or None on failure (triggers deterministic fallback).
     """
-    user_prompt = build_recommend_prompt(user_message, products, basket, history)
+    user_prompt = build_recommend_prompt(user_message, products, basket, history, shop_type)
+    system_prompt = get_recommend_system_prompt(shop_type)
 
     messages = [
-        {"role": "system", "content": RECOMMEND_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 

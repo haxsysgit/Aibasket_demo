@@ -26,7 +26,8 @@ from llm.openai_client import (
     generate_clarification_llm,
     recommend_from_catalog,
     is_llm_available,
-    RECOMMEND_SYSTEM,
+    get_recommend_system_prompt,
+    get_recommend_yaml_raw,
     INTENT_EXTRACTION_SYSTEM,
     CLARIFICATION_SYSTEM,
     build_recommend_prompt,
@@ -196,18 +197,22 @@ def chat(req: ChatRequest):
     # ===================================================================
     # LLM PATH: Send full catalog, let LLM pick products + write response
     # ===================================================================
+    store = req.store_type or "shop"
+
     if llm_active:
         llm_result = recommend_from_catalog(
-            req.message, product_dicts, basket_context, history
+            req.message, product_dicts, basket_context, history, store
         )
 
         if llm_result is not None:
             # Record prompt transparency
             user_prompt = build_recommend_prompt(
-                req.message, product_dicts, basket_context, history
+                req.message, product_dicts, basket_context, history, store
             )
+            rendered_system = get_recommend_system_prompt(store)
             prompts["recommendation"] = {
-                "system": RECOMMEND_SYSTEM,
+                "system_yaml_template": get_recommend_yaml_raw(),
+                "system_rendered": rendered_system,
                 "user": user_prompt,
                 "model_output": {
                     "recommended_ids": llm_result["recommended_ids"],
