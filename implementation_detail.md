@@ -2,11 +2,11 @@
 
 ## 1. What This Is
 
-A working demo of an AI-powered shopping assistant. A customer tells it what they want in natural language, and the system recommends products, asks one clarifying question, suggests a complementary item, and handles a simulated checkout.
+A working demo of an AI-powered shopping assistant. A customer tells it what they want in natural language, and the LLM browses the product catalog, picks the best-matching items, explains its reasoning, and handles multi-turn conversation — all within a validated pipeline that prevents hallucinations.
 
-It runs across four store types — café, pub, bakery, corner shop — each with its own product catalog. Switch the store dropdown and the entire experience changes: different products, different chips, different upsells.
+It runs across four store types — café, pub, bakery, corner shop — each with its own product catalog (71 items total). Switch the store dropdown and the entire experience changes: different products, different prompts, different context. The system prompt itself is dynamic — loaded from a YAML template and rendered per shop type.
 
-The backend is a Python FastAPI server with an optional OpenAI LLM layer. The frontend is Vue 3 with Tailwind CSS. There is no database, no authentication, and no real payment. Every product decision the system makes is deterministic. The LLM handles understanding (intent extraction) and speaking (response generation) — it never picks, ranks, or invents products.
+The backend is a Python FastAPI server with an LLM-first recommendation flow (GPT-4o-mini). The frontend is Vue 3 with Tailwind CSS. There is no database, no authentication, and no real payment. The LLM receives the full product catalog for the selected store, picks products, and writes the response. A validation layer checks every product ID the LLM returns against the real catalog — hallucinated products are stripped before they reach the user. If the LLM is unavailable, the system falls back to a deterministic keyword-matching engine.
 
 ---
 
@@ -20,25 +20,38 @@ The backend is a Python FastAPI server with an optional OpenAI LLM layer. The fr
 │       → ProductCards → UpsellPrompt              │
 │       → BasketPanel → CheckoutScreen             │
 │                                                  │
-│  api.js — fetch('/api/...')                       │
+│  api.js — fetch('/api/chat')                     │
+│  Prompt Transparency Panel (shows YAML + output) │
 └──────────────┬───────────────────────────────────┘
                │ HTTP POST (JSON)
                ▼
 ┌──────────────────────────────────────────────────┐
 │  FastAPI Backend (:8000)                         │
 │                                                  │
+│  POST /api/chat (main LLM-first endpoint)        │
 │  POST /api/classify-intent                       │
 │  POST /api/recommend                             │
 │  POST /api/upsell                                │
 │                                                  │
-│  ┌────────────┐  ┌──────────┐  ┌─────────────┐  │
-│  │ Intent     │  │ Filter   │  │ Ranker      │  │
-│  │ Extraction │→ │ Engine   │→ │ (weighted   │  │
-│  │            │  │          │  │  scoring)   │  │
-│  └────────────┘  └──────────┘  └─────────────┘  │
+│  ┌────────────────────────────────────────────┐  │
+│  │  LLM PATH (GPT-4o-mini)                   │  │
+│  │                                            │  │
+│  │  1. Load prompt YAML (recommend.yaml)      │  │
+│  │  2. Render with {shop_type} substitution   │  │
+│  │  3. Inject full product catalog            │  │
+│  │  4. LLM picks products + writes response   │  │
+│  │  5. Validation: check IDs against catalog  │  │
+│  │  6. Deterministic upsell from curated pairs│  │
+│  └────────────────────────────────────────────┘  │
 │                                                  │
 │  ┌────────────────────────────────────────────┐  │
-│  │ products.json — 60+ products, 4 stores     │  │
+│  │  FALLBACK PATH (no API key / LLM failure)  │  │
+│  │  Keyword intent → filter → weighted rank   │  │
+│  └────────────────────────────────────────────┘  │
+│                                                  │
+│  ┌────────────────────────────────────────────┐  │
+│  │ products.json — 71 products, 4 stores      │  │
+│  │ prompts/recommend.yaml — YAML template     │  │
 │  └────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
 ```
@@ -48,20 +61,25 @@ The backend is a Python FastAPI server with an optional OpenAI LLM layer. The fr
 The frontend handles presentation and user interaction. It knows nothing about products, ranking, or business logic. The backend handles all decisions. This separation means:
 
 - The product catalog and ranking logic never reach the browser
-- The API contract is clean — three endpoints, JSON in, JSON out
+- The API contract is clean — JSON in, JSON out
 - Swapping the frontend (to a widget, mobile app, or chatbot) requires zero backend changes
+- The prompt transparency panel shows the full YAML template, rendered prompt, and LLM output
 
 ---
 
 ## 3. Design Decisions
 
-### 3.1 Deterministic Engine, Not an LLM
+### 3.1 LLM-First Recommendations with Deterministic Fallback
 
-The system uses keyword matching and weighted scoring — not a language model. This was deliberate.
+The LLM (GPT-4o-mini) receives the **full product catalog** for the selected store and recommends products directly. It browses the catalog, matches on category/tags/dietary/taste/price/portion, picks 1-3 products, and explains its reasoning — all in a single API call.
 
-An LLM would introduce latency, cost, and unpredictability. For a recommendation engine, you need **consistency**: the same input should always produce the same output. A customer saying "quick light lunch" should get the same top pick every time, not whatever the model feels like generating.
+This is deliberate. The product catalog is small enough (15-20 items per store) that the LLM can reason over every item. Passing the full catalog means the LLM doesn't need a separate filtering step — it sees everything and makes informed choices.
 
-The architecture is designed so an LLM can be layered on top later — to handle the conversational phrasing — without changing any product decisions. The engine decides *what* to recommend; the AI (when added) would decide *how to say it*.
+**Why not pure deterministic?** A keyword-matching engine can't understand "I'm hungover and need something greasy" or "something my vegan girlfriend would like". The LLM handles natural language nuance that deterministic rules can't.
+
+**Why not pure LLM?** Without validation, the LLM could hallucinate products. The validation layer checks every product ID the LLM returns against the real catalog. Hallucinated IDs are stripped. If all IDs are fake, the system falls back to the deterministic engine — keyword matching + weighted scoring. The demo always works.
+
+**The fallback engine** uses the same weighted scoring formula as before (65% customer intent, 35% business factors). It activates when `OPENAI_API_KEY` is missing or the LLM call fails.
 
 ### 3.2 Store Type as a First-Class Filter
 
@@ -152,19 +170,21 @@ The UI mirrors the Strivonex brand: slate-950 backgrounds, fuchsia-to-cyan gradi
 │   └── upsell.py             # Complementary product selection
 │
 ├── llm/
-│   ├── openai_client.py      # OpenAI: intent extraction + response generation
+│   ├── openai_client.py      # LLM-first: catalog recommendation + intent extraction
+│   ├── prompts/
+│   │   └── recommend.yaml    # YAML prompt template with {shop_type} substitution
 │   └── simulated.py          # Static response templates (pre-LLM)
 │
 ├── models/
 │   └── schemas.py            # Core data models (Product, Intent, etc.)
 │
 ├── data/
-│   └── products.json         # 60+ products across 4 store types
+│   └── products.json         # 71 products across 4 store types
 │
 ├── frontend/
 │   ├── src/
 │   │   ├── App.vue           # Main orchestrator — stage machine
-│   │   ├── api.js            # HTTP client for 3 endpoints
+│   │   ├── api.js            # HTTP client for chat + legacy endpoints
 │   │   ├── engine.js         # Client-side engine (for static deploy)
 │   │   └── components/
 │   │       ├── IntentSelector.vue    # Chips + free text input
@@ -177,7 +197,7 @@ The UI mirrors the Strivonex brand: slate-950 backgrounds, fuchsia-to-cyan gradi
 │       └── products.json     # Copy for static deployment
 │
 ├── tests/
-│   └── test_api.py           # 21 pytest tests covering all endpoints
+│   └── test_api.py           # 42 pytest tests (API, chat, validation, YAML prompts)
 │
 ├── deploy/
 │   ├── setup.sh              # One-command Ubuntu deploy
@@ -311,15 +331,20 @@ The store type dropdown resets everything — basket, recommendations, stage —
 
 ## 8. Testing
 
-21 automated tests cover the three endpoints:
+42 automated tests cover all endpoints, the chat flow, and the validation layer:
 
 - **Intent classification** — light lunch, quick snack, vegan request, budget signal, vague input
 - **Recommendations** — correct count per behaviour, clarification logic, required fields, category filtering
 - **Store isolation** — pub products never appear in café results and vice versa
 - **Upsell** — returns complementary product, excludes basket items, handles invalid IDs
+- **Multi-turn chat** — basic chat, response shape, history handling, max turns (4), basket awareness, clarification on first turn only, empty messages
+- **Validation layer** — intent stripping (bad categories/preferences/modifiers/dietary/behaviour), response text rejection (empty, too short, too long), clarification sanitisation
+- **Recommendation validation** — hallucinated product IDs stripped, all-hallucinated returns None, limits to 3 products, clarification pass-through
+- **YAML prompt** — template loads correctly, `{shop_type}` substitution works per store type, rendered prompts contain correct shop context
+- **Catalog formatting** — product catalog renders with all fields (id, name, price, dietary, upsells)
 
 ```bash
-uv run pytest tests/ -v   # 21 passed
+uv run pytest tests/ -v   # 42 passed
 ```
 
 ---
@@ -353,54 +378,94 @@ bash deploy/expose-tunnel.sh   # Get a public URL via Cloudflare Tunnel
 
 ## 10. LLM Integration Layer
 
-### Where the LLM Is Used
+### How It Works
 
-The LLM (GPT-4o-mini) has exactly two jobs:
+The LLM (GPT-4o-mini) is the **primary recommendation engine**. On every `/api/chat` request:
 
-**1. Intent Extraction** — Turn free text like "something sweet but not too heavy" into structured JSON:
-```json
-{"category": "snack", "preferences": ["sweet", "light"], "modifiers": [], "dietary": [], "behaviour": "exploring"}
+1. The backend loads the store-filtered product catalog (15-20 items)
+2. The YAML prompt template (`llm/prompts/recommend.yaml`) is loaded and rendered with the customer's `{shop_type}` — substituting role, context, and instructions
+3. The rendered YAML system prompt + the product catalog + the user's message are sent to the LLM
+4. The LLM browses the catalog, picks 1-3 products by ID, writes a reasoning string, and composes a natural response
+5. The validation layer checks every returned product ID against the real catalog
+6. Hallucinated IDs are stripped. If zero valid IDs remain, the system falls back to the deterministic engine
+7. Deterministic upsell logic checks the first recommended product's curated pairs
+
+### YAML Prompt Architecture
+
+The system prompt is defined in `llm/prompts/recommend.yaml` — not as a Python string constant. This is deliberate:
+
+- **Structured YAML > unstructured prose.** LLMs parse structured input more reliably. Sections like `product_selection`, `message_rules`, `multi_turn`, and `clarification` are clearly delineated.
+- **Dynamic `{shop_type}` substitution.** The role field reads `"You are an AI shopping assistant for a {shop_type}."` At runtime, `{shop_type}` becomes "café", "pub", "bakery", or "corner shop".
+- **Per-store context injection.** The YAML contains a `shop_context` map with descriptions for each store type. Only the relevant one is injected:
+  - *café*: "A casual café serving fresh food, hot drinks, and light bites..."
+  - *pub*: "A traditional British pub serving hearty meals, bar snacks, and drinks..."
+  - *bakery*: "A high-street bakery selling fresh bread, pastries, cakes..."
+  - *corner shop*: "A convenience store selling prepacked food, drinks, and snacks..."
+- **Editable without code changes.** Prompt tuning is a YAML edit, not a Python deploy.
+- **Visible in the UI.** The prompt transparency panel shows both the raw YAML template and the rendered version with shop type substituted.
+
+### What the LLM Sees
+
+The user prompt sent to the model contains:
+
+```
+Customer said: "I want something healthy and light"
+
+--- PRODUCT CATALOG (20 items) ---
+- id:cafe_001 | Flat White | £3.40 | cat:drink | tags:[classic, hot, milk] | dietary:[vegetarian] | ...
+- id:cafe_002 | Avocado Toast | £7.50 | cat:lunch | tags:[healthy, light, fresh] | dietary:[vegan] | ...
+... (all store products)
+
+--- ALREADY IN BASKET (do not recommend these) ---
+  - Flat White (id:cafe_001)
 ```
 
-**2. Response Generation** — Take the engine's ranked products and phrase them naturally:
-> "I recommend the Chocolate Brownie! It's sweet and indulgent, yet still light enough. Most people also grab a Flat White Coffee."
+The LLM returns structured JSON:
 
-### Where the LLM Is NOT Used
+```json
+{
+  "recommended_ids": ["cafe_002", "cafe_016"],
+  "reasoning": "Avocado Toast is light, fresh, and vegan. The Acai Bowl is a healthy option with fruit.",
+  "message": "The Avocado Toast would be perfect — it's light, fresh, and only £7.50. If you're after something a bit different, the Acai Bowl is packed with fruit and is naturally vegan too.",
+  "needs_clarification": false,
+  "clarification_question": null
+}
+```
 
-- Product filtering (deterministic: category + dietary + store type)
-- Product ranking (deterministic: weighted scoring formula)
-- Upsell selection (deterministic: curated pairs sorted by popularity)
-- Clarification questions (deterministic: hardcoded per category)
+### Validation Layer
 
-### Why This Hybrid Approach
+Every LLM response passes through `validate_recommendation()`:
 
-A pure LLM approach would let the model choose products. This is dangerous:
-- It can **hallucinate products** that don't exist in the catalog
-- It **ignores business rules** (margin, conversion, popularity)
-- It's **unpredictable** — same input can give different outputs
-- It's **untestable** — you can't write deterministic assertions
+| Check | Action |
+|---|---|
+| Product ID not in catalog | Stripped from results |
+| All product IDs hallucinated | Returns `None` → deterministic fallback |
+| More than 3 products | Truncated to 3 |
+| Message too short (<10 chars) | Set to `None` → static template used |
+| Message too long (>800 chars) | Truncated at last sentence boundary |
+| Clarification question too short/long | Rejected |
 
-The hybrid approach gives you:
-- **Reliability** — the engine always picks valid, well-scored products
-- **Testability** — 21 automated tests verify product decisions
-- **Natural language** — the LLM makes the interaction feel human
-- **Controllability** — business rules are in code, not in prompts
+This means the LLM can never surface a product that doesn't exist in the real catalog. The worst case is a fallback to the deterministic engine — the demo never breaks.
 
-### Prompt Design
+### Multi-Turn Conversation
 
-Both prompts are exposed in the UI via "Show AI reasoning":
+The `/api/chat` endpoint supports up to 4 conversation turns. On each follow-up:
 
-**Intent extraction prompt** constrains the model to a fixed schema with allowed values. Temperature is set to 0.1 for consistency. The model returns JSON only — no explanation, no markdown.
-
-**Response generation prompt** receives only the engine-selected products. The model is told: "Recommend ONLY from the products provided below. Do not invent products." This prevents hallucination structurally — the model can only reference what the engine chose.
+- The full conversation history is sent to the LLM alongside the product catalog
+- The LLM sees what was previously recommended and can adjust
+- **Refinements** ("something cheaper", "make it vegan") → LLM adjusts picks from the same catalog
+- **Pivots** ("forget that, I want a drink") → LLM starts fresh from a different category
+- Basket awareness prevents re-recommending items already added
 
 ### Fallback Behaviour
 
-If `OPENAI_API_KEY` is missing or any API call fails:
-- Intent extraction falls back to keyword matching (`engine/intent.py`)
-- Response generation falls back to static template strings
+If `OPENAI_API_KEY` is missing or any LLM call fails:
+
+- The deterministic engine activates: keyword-based intent extraction → category/dietary filtering → weighted scoring
+- Clarification uses hardcoded questions per category
+- Response uses static template strings
 - A warning is logged — no error shown to the user
-- The demo works identically, just without LLM phrasing
+- The demo works identically, just without LLM reasoning
 
 ---
 
@@ -410,18 +475,21 @@ This demo is a proof of concept. Here's what changes — and what doesn't — wh
 
 ### What Stays the Same
 
-- **The ranking formula.** Weighted scoring is the right architecture. The weights get tuned with real data, but the approach is sound.
-- **The API contract.** Three endpoints, JSON in/out. This interface works for a widget, mobile app, or chatbot.
+- **The LLM-first recommendation approach.** Passing the product catalog to the LLM works well for small-to-medium catalogs. The architecture scales with prompt engineering and model improvements.
+- **YAML prompt templates.** Structured prompts with dynamic substitution. In production, prompts become versioned and A/B tested.
+- **Validation layer.** Every LLM output must be checked against the real catalog. This pattern is essential at any scale.
 - **Store isolation.** Products partitioned by store type. In production, each store would have its own catalog in a database.
+- **The API contract.** JSON in/out. This interface works for a widget, mobile app, or chatbot.
 
 ### What Changes
 
 | Demo | Production |
 |---|---|
-| `products.json` (60 items) | PostgreSQL or Redis with thousands of products per store |
-| GPT-4o-mini for intent (demo) | Fine-tuned model or GPT-4 for higher accuracy |
-| Static ranking weights | A/B tested weights, updated from conversion data |
-| Hardcoded upsell pairs | ML model trained on purchase history (association rules, collaborative filtering) |
+| `products.json` (71 items) | PostgreSQL or Redis with thousands of products per store |
+| Full catalog in prompt | RAG retrieval for large catalogs (embed + retrieve top-N, then pass to LLM) |
+| GPT-4o-mini | Fine-tuned model or GPT-4 for higher accuracy |
+| Single YAML prompt | Versioned prompts, A/B tested per store type |
+| Static upsell pairs | ML model trained on purchase history (association rules, collaborative filtering) |
 | No auth | OAuth / API keys per retailer |
 | Single process | Kubernetes pods behind a load balancer |
 | No analytics | Event pipeline → warehouse → dashboards |
@@ -456,6 +524,11 @@ This demo is a proof of concept. Here's what changes — and what doesn't — wh
 
 ### The Key Insight
 
-The demo proves that the **decision architecture** works: structured intent → filtered candidates → weighted ranking → complementary upsell. That pipeline is the same at 60 products or 60,000. What scales is the data sources and the intelligence of each step — not the flow itself.
+The demo proves that an **LLM can be a reliable recommendation engine** when you give it the right structure:
 
-The LLM doesn't replace the engine. It sits alongside it: the engine decides *what* to recommend, the LLM decides *how to say it*. That separation is what makes the system reliable, testable, and controllable — properties you need in production but can't get from a pure AI approach.
+1. **Ground it in real data.** The LLM sees the actual product catalog — not a vague instruction to "recommend food". It can only pick from what exists.
+2. **Validate everything.** The validation layer catches hallucinations before they reach the user. The worst case is a fallback to deterministic logic — the demo never breaks.
+3. **Structure the prompt.** YAML templates with dynamic substitution produce more consistent LLM behaviour than unstructured prose. Each shop type gets its own context, tone, and product knowledge.
+4. **Keep an escape hatch.** The deterministic engine sits behind the LLM. No API key, bad response, rate limit? The system still works.
+
+This architecture scales: for larger catalogs, swap "full catalog in prompt" for RAG retrieval (embed products → retrieve top-N → pass to LLM). The prompt template, validation layer, and multi-turn conversation all remain the same.
