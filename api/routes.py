@@ -21,11 +21,14 @@ from engine.intent import extract_intent
 from engine.ranker import get_top_recommendations
 from engine.upsell import get_upsell
 from llm.openai_client import (
+    MAX_TURNS,
     extract_intent_llm,
+    generate_clarification_llm,
     generate_response_llm,
     is_llm_available,
     INTENT_EXTRACTION_SYSTEM,
     RESPONSE_GENERATION_SYSTEM,
+    CLARIFICATION_SYSTEM,
     _build_response_user_prompt,
 )
 from models.schemas import Intent, Product
@@ -165,16 +168,38 @@ def classify_intent(req: ClassifyRequest):
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    """Combined endpoint: LLM intent extraction → deterministic ranking → LLM response.
+    """Multi-turn chat: LLM intent → deterministic ranking → LLM response.
 
-    Falls back to keyword-based extraction if LLM is unavailable.
+    Supports follow-ups, pivots, basket awareness, contextual clarification.
+    Falls back to keyword-based logic if LLM is unavailable.
     """
     products = _filter_by_store(_load_products(), req.store_type)
     llm_active = is_llm_available()
     prompts: dict = {}
+    history = [{"role": m.role, "content": m.content} for m in req.history]
+    turn_count = len([m for m in req.history if m.role == "user"]) + 1
+    can_follow_up = turn_count < MAX_TURNS
 
-    # --- Step 1: Intent extraction (LLM or fallback) ---
-    llm_intent = extract_intent_llm(req.message) if llm_active else None
+    # Build previous intent from history (for multi-turn refinement)
+    previous_intent = None
+    if req.history:
+        # Try to re-extract the previous intent from the first user message
+        # This is lightweight — the LLM prompt handles context awareness
+        first_user_msg = next((m.content for m in req.history if m.role == "user"), None)
+        if first_user_msg:
+            prev = extract_intent(first_user_msg)
+            previous_intent = {
+                "category": prev.category,
+                "preferences": prev.preferences,
+                "modifiers": prev.modifiers,
+                "dietary": prev.dietary,
+                "behaviour": prev.behaviour,
+            }
+
+    # --- Step 1: Intent extraction (LLM with history, or fallback) ---
+    llm_intent = None
+    if llm_active:
+        llm_intent = extract_intent_llm(req.message, history, previous_intent)
 
     if llm_intent is not None:
         intent = Intent(
@@ -190,7 +215,6 @@ def chat(req: ChatRequest):
             "model_output": llm_intent,
         }
     else:
-        # Deterministic fallback
         intent = extract_intent(req.message)
 
     intent_response = ClassifyResponse(
@@ -201,9 +225,28 @@ def chat(req: ChatRequest):
         behaviour=intent.behaviour,
     )
 
-    # --- Step 2: Clarification check ---
-    if not intent.preferences and not intent.modifiers and intent.category:
-        clarification = CLARIFICATION_MAP.get(intent.category)
+    # --- Step 2: Contextual clarification (LLM or hardcoded fallback) ---
+    needs_clarification = (
+        not intent.preferences
+        and not intent.modifiers
+        and not intent.dietary
+        and (intent.category is None or intent.category in CLARIFICATION_MAP)
+        and turn_count == 1  # Only clarify on first turn
+    )
+
+    if needs_clarification:
+        clarification = None
+        if llm_active:
+            clarification = generate_clarification_llm(req.message, history)
+            if clarification:
+                prompts["clarification"] = {
+                    "system": CLARIFICATION_SYSTEM,
+                    "user": req.message,
+                    "model_output": clarification,
+                }
+        if clarification is None and intent.category:
+            clarification = CLARIFICATION_MAP.get(intent.category)
+
         if clarification:
             filtered = filter_products(products, intent)
             recs = get_top_recommendations(filtered, intent) if filtered else []
@@ -214,6 +257,8 @@ def chat(req: ChatRequest):
                 intent_used=intent_response,
                 llm_used=llm_intent is not None,
                 prompts=prompts,
+                can_follow_up=True,
+                turn_count=turn_count,
             )
 
     # --- Step 3: Deterministic filtering + ranking ---
@@ -226,12 +271,14 @@ def chat(req: ChatRequest):
             intent_used=intent_response,
             llm_used=llm_intent is not None,
             prompts=prompts,
+            can_follow_up=can_follow_up,
+            turn_count=turn_count,
         )
 
     recs = get_top_recommendations(filtered, intent)
     product_outs = [_product_to_out(p, intent) for p in recs]
 
-    # --- Step 4: Upsell (deterministic) ---
+    # --- Step 4: Upsell (deterministic selection, LLM phrasing) ---
     upsell_out = None
     upsell_msg = ""
     if recs:
@@ -241,16 +288,27 @@ def chat(req: ChatRequest):
             upsell_out = _product_to_out(upsell_product)
             upsell_msg = f"Most people pair this with a {upsell_product.name}"
 
-    # --- Step 5: LLM response generation (or static fallback) ---
+    # --- Step 5: LLM response (with product reasoning, basket, history) ---
     product_dicts = [p.model_dump() for p in product_outs]
     upsell_dict = upsell_out.model_dump() if upsell_out else None
 
+    # Build basket context for the LLM
+    basket_context = None
+    if req.basket_ids:
+        product_map = {p.id: p for p in products}
+        basket_context = [
+            {"name": product_map[bid].name, "price": product_map[bid].price}
+            for bid in req.basket_ids if bid in product_map
+        ]
+
     ai_msg = None
     if llm_active:
-        ai_msg = generate_response_llm(req.message, product_dicts, upsell_dict)
+        ai_msg = generate_response_llm(
+            req.message, product_dicts, upsell_dict, basket_context, history
+        )
         if ai_msg:
             response_user_prompt = _build_response_user_prompt(
-                req.message, product_dicts, upsell_dict
+                req.message, product_dicts, upsell_dict, basket_context, history
             )
             prompts["response_generation"] = {
                 "system": RESPONSE_GENERATION_SYSTEM,
@@ -274,4 +332,6 @@ def chat(req: ChatRequest):
         intent_used=intent_response,
         llm_used=llm_intent is not None,
         prompts=prompts,
+        can_follow_up=can_follow_up,
+        turn_count=turn_count,
     )

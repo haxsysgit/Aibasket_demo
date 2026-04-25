@@ -53,10 +53,16 @@ class ClassifyResponse(BaseModel):
     behaviour: str = "exploring"
 
 
+class ConversationMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
 class ChatRequest(BaseModel):
     message: str
     store_type: str = "cafe"
     basket_ids: list[str] = []
+    history: list[ConversationMessage] = []
 
 
 class ChatResponse(BaseModel):
@@ -68,3 +74,5 @@ class ChatResponse(BaseModel):
     intent_used: ClassifyResponse | None = None
     llm_used: bool = False
     prompts: dict = {}
+    can_follow_up: bool = True
+    turn_count: int = 0

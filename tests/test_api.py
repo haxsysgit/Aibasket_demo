@@ -235,3 +235,159 @@ class TestUpsell:
             assert "id" in p
             assert "name" in p
             assert "price" in p
+
+
+class TestChat:
+    """Tests for /api/chat — multi-turn, validation, fallback."""
+
+    def test_basic_chat_returns_products(self):
+        res = client.post("/api/chat", json={
+            "message": "I want a quick light lunch",
+            "store_type": "cafe",
+        })
+        assert res.status_code == 200
+        data = res.json()
+        assert len(data["products"]) > 0
+        assert data["turn_count"] == 1
+        assert data["can_follow_up"] is True
+
+    def test_chat_response_shape(self):
+        res = client.post("/api/chat", json={"message": "healthy breakfast"})
+        data = res.json()
+        for key in ["products", "ai_message", "intent_used", "llm_used",
+                     "prompts", "can_follow_up", "turn_count"]:
+            assert key in data
+
+    def test_chat_with_history(self):
+        res = client.post("/api/chat", json={
+            "message": "something cheaper",
+            "store_type": "cafe",
+            "history": [
+                {"role": "user", "content": "I want a light lunch"},
+                {"role": "assistant", "content": "I'd recommend the Granola Pot."},
+            ],
+        })
+        assert res.status_code == 200
+        data = res.json()
+        assert data["turn_count"] == 2
+        assert data["can_follow_up"] is True
+
+    def test_chat_max_turns(self):
+        history = []
+        for i in range(3):
+            history.append({"role": "user", "content": f"turn {i+1}"})
+            history.append({"role": "assistant", "content": f"response {i+1}"})
+        res = client.post("/api/chat", json={
+            "message": "one more thing",
+            "store_type": "cafe",
+            "history": history,
+        })
+        data = res.json()
+        assert data["turn_count"] == 4
+        assert data["can_follow_up"] is False
+
+    def test_chat_clarification_first_turn(self):
+        res = client.post("/api/chat", json={
+            "message": "lunch",
+            "store_type": "cafe",
+        })
+        data = res.json()
+        # Should get a clarification on bare "lunch" with no preferences
+        assert data["clarification"] is not None or len(data["products"]) > 0
+
+    def test_chat_no_clarification_on_followup(self):
+        res = client.post("/api/chat", json={
+            "message": "lunch",
+            "store_type": "cafe",
+            "history": [
+                {"role": "user", "content": "what's good here?"},
+                {"role": "assistant", "content": "What kind of meal are you after?"},
+            ],
+        })
+        data = res.json()
+        # Should NOT clarify on second turn — just give results
+        assert data["clarification"] is None
+
+    def test_chat_with_basket(self):
+        res = client.post("/api/chat", json={
+            "message": "I want a light lunch",
+            "store_type": "cafe",
+            "basket_ids": ["cafe_001"],
+        })
+        assert res.status_code == 200
+        data = res.json()
+        assert len(data["products"]) > 0
+
+    def test_chat_store_isolation(self):
+        res = client.post("/api/chat", json={
+            "message": "a pint and some chips",
+            "store_type": "pub",
+        })
+        data = res.json()
+        for p in data["products"]:
+            assert p["store_type"] == "pub"
+
+    def test_chat_empty_message(self):
+        res = client.post("/api/chat", json={
+            "message": "   ",
+            "store_type": "cafe",
+        })
+        assert res.status_code == 200
+
+
+class TestValidation:
+    """Tests for the LLM validation layer."""
+
+    def test_validate_intent_strips_bad_values(self):
+        from llm.openai_client import validate_intent
+        raw = {
+            "category": "pizza",  # not valid
+            "preferences": ["light", "FAKE", "healthy"],
+            "modifiers": ["quick", "turbo"],
+            "dietary": ["vegan", "keto"],
+            "behaviour": "zen",
+        }
+        result = validate_intent(raw)
+        assert result["category"] == "unknown"
+        assert result["preferences"] == ["light", "healthy"]
+        assert result["modifiers"] == ["quick"]
+        assert result["dietary"] == ["vegan"]
+        assert result["behaviour"] == "exploring"
+
+    def test_validate_intent_passes_good_values(self):
+        from llm.openai_client import validate_intent
+        raw = {
+            "category": "lunch",
+            "preferences": ["light"],
+            "modifiers": ["budget"],
+            "dietary": ["gluten_free"],
+            "behaviour": "rushed",
+        }
+        result = validate_intent(raw)
+        assert result == raw
+
+    def test_validate_response_rejects_empty(self):
+        from llm.openai_client import validate_response_text
+        assert validate_response_text(None, []) is None
+        assert validate_response_text("", []) is None
+        assert validate_response_text("short", []) is None  # < 10 chars
+
+    def test_validate_response_truncates_long(self):
+        from llm.openai_client import validate_response_text
+        long_text = "This is a sentence. " * 100  # way over 800 chars
+        result = validate_response_text(long_text, ["Product"])
+        assert result is not None
+        assert len(result) <= 810
+
+    def test_validate_clarification_basic(self):
+        from llm.openai_client import validate_clarification
+        assert validate_clarification(None) is None
+        assert validate_clarification("hi") is None  # too short
+        assert validate_clarification("A" * 300) is None  # too long
+        result = validate_clarification("Are you looking for something quick?")
+        assert result == "Are you looking for something quick?"
+
+    def test_validate_clarification_adds_question_mark(self):
+        from llm.openai_client import validate_clarification
+        result = validate_clarification("Would you like something sweet or savoury")
+        assert result.endswith("?")

@@ -76,12 +76,16 @@ function localUpsell(productId, basketIds, storeType) {
   }
 }
 
-function localChat(message, storeType, basketIds) {
+const MAX_TURNS = 4
+
+function localChat(message, storeType, basketIds, history = []) {
   const intent = extractIntent(message)
   const products = filterByStore(loadProducts(), storeType)
+  const turnCount = history.filter(m => m.role === 'user').length + 1
+  const canFollowUp = turnCount < MAX_TURNS
 
-  // Clarification check
-  if (!intent.preferences.length && !intent.modifiers.length && intent.category) {
+  // Clarification check — first turn only
+  if (!intent.preferences.length && !intent.modifiers.length && !intent.dietary.length && intent.category && turnCount === 1) {
     const clarification = getClarification(intent.category)
     if (clarification) {
       const filtered = filterProducts(products, intent)
@@ -95,6 +99,8 @@ function localChat(message, storeType, basketIds) {
         intent_used: intent,
         llm_used: false,
         prompts: {},
+        can_follow_up: true,
+        turn_count: turnCount,
       }
     }
   }
@@ -133,6 +139,8 @@ function localChat(message, storeType, basketIds) {
     intent_used: intent,
     llm_used: false,
     prompts: {},
+    can_follow_up: canFollowUp,
+    turn_count: turnCount,
   }
 }
 
@@ -159,9 +167,9 @@ export async function getUpsell(productId, basketIds, storeType = 'cafe') {
   return localUpsell(productId, basketIds, storeType)
 }
 
-export async function chat(message, storeType = 'cafe', basketIds = []) {
+export async function chat(message, storeType = 'cafe', basketIds = [], history = []) {
   if (await hasBackend()) {
-    return postJson('/chat', { message, store_type: storeType, basket_ids: basketIds })
+    return postJson('/chat', { message, store_type: storeType, basket_ids: basketIds, history })
   }
-  return localChat(message, storeType, basketIds)
+  return localChat(message, storeType, basketIds, history)
 }

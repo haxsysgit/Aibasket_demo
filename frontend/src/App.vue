@@ -46,6 +46,12 @@ const aiPrompts = ref({})
 const aiLlmUsed = ref(false)
 const showReasoning = ref(false)
 
+// Multi-turn conversation
+const conversationHistory = ref([])
+const turnCount = ref(0)
+const canFollowUp = ref(true)
+const followUpText = ref('')
+
 // Basket
 const basket = ref([])
 const basketIds = computed(() => basket.value.map(i => i.id))
@@ -81,19 +87,42 @@ async function handleChipSelect(chip) {
 }
 
 async function handleCustomInput(text) {
+  // First turn — fresh conversation
+  conversationHistory.value = []
+  turnCount.value = 0
+  canFollowUp.value = true
+  await sendChat(text)
+}
+
+async function handleFollowUp() {
+  const text = followUpText.value.trim()
+  if (!text) return
+  followUpText.value = ''
+  await sendChat(text)
+}
+
+async function sendChat(text) {
   loading.value = true
   stage.value = 'loading'
-  aiMessage.value = ''
-  aiPrompts.value = {}
-  aiLlmUsed.value = false
 
   try {
-    const data = await chat(text, storeType.value, basketIds.value)
+    const data = await chat(text, storeType.value, basketIds.value, conversationHistory.value)
+
+    // Update conversation history
+    conversationHistory.value.push({ role: 'user', content: text })
+    conversationHistory.value.push({ role: 'assistant', content: data.ai_message || data.clarification || '' })
+
+    // Cap history at last 4 turns (8 messages)
+    if (conversationHistory.value.length > 8) {
+      conversationHistory.value = conversationHistory.value.slice(-8)
+    }
 
     // Store AI state
     aiMessage.value = data.ai_message || ''
     aiPrompts.value = data.prompts || {}
     aiLlmUsed.value = data.llm_used || false
+    turnCount.value = data.turn_count || 1
+    canFollowUp.value = data.can_follow_up !== false
 
     // Store intent
     if (data.intent_used) {
@@ -104,12 +133,11 @@ async function handleCustomInput(text) {
       currentBehaviour.value = data.intent_used.behaviour || 'exploring'
     }
 
-    // Handle clarification
+    // Handle clarification — show as AI message with follow-up input (no chip stage)
     if (data.clarification) {
       recommendations.value = data.products || []
-      clarification.value = data.clarification
-      clarificationOptions.value = buildClarificationOptions(data.clarification)
-      stage.value = 'clarifying'
+      aiMessage.value = data.clarification
+      stage.value = 'results'
       return
     }
 
@@ -249,6 +277,10 @@ function restart() {
   aiPrompts.value = {}
   aiLlmUsed.value = false
   showReasoning.value = false
+  conversationHistory.value = []
+  turnCount.value = 0
+  canFollowUp.value = true
+  followUpText.value = ''
 }
 </script>
 
@@ -348,9 +380,18 @@ function restart() {
               <pre class="text-green-400 bg-slate-800/50 rounded p-2">{{ JSON.stringify(aiPrompts.intent_extraction.model_output, null, 2) }}</pre>
             </div>
 
+            <!-- Clarification -->
+            <div v-if="aiPrompts.clarification" class="space-y-1">
+              <p class="text-cyan-400 font-semibold">2. Contextual Clarification</p>
+              <p class="text-slate-500">System prompt:</p>
+              <pre class="text-slate-400 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-32 overflow-y-auto">{{ aiPrompts.clarification.system }}</pre>
+              <p class="text-slate-500">Model output:</p>
+              <pre class="text-green-400 bg-slate-800/50 rounded p-2">"{{ aiPrompts.clarification.model_output }}"</pre>
+            </div>
+
             <!-- Response Generation -->
             <div v-if="aiPrompts.response_generation" class="space-y-1">
-              <p class="text-cyan-400 font-semibold">2. Response Generation</p>
+              <p class="text-cyan-400 font-semibold">{{ aiPrompts.clarification ? '3' : '2' }}. Response Generation</p>
               <p class="text-slate-500">System prompt:</p>
               <pre class="text-slate-400 whitespace-pre-wrap bg-slate-800/50 rounded p-2 max-h-32 overflow-y-auto">{{ aiPrompts.response_generation.system }}</pre>
               <p class="text-slate-500">Context sent to model:</p>
@@ -370,10 +411,45 @@ function restart() {
           </div>
 
           <ProductCards
+            v-if="recommendations.length"
             :products="recommendations"
             @add="handleAddProduct"
             @restart="restart"
           />
+
+          <!-- Follow-up input -->
+          <div v-if="canFollowUp" class="mt-4">
+            <div class="flex gap-2">
+              <input
+                v-model="followUpText"
+                @keyup.enter="handleFollowUp"
+                :placeholder="turnCount >= 4 ? 'Max turns reached — start fresh' : 'Refine, ask for alternatives, or change your mind...'"
+                :disabled="turnCount >= 4"
+                class="flex-1 px-4 py-2.5 rounded-lg border border-slate-700 bg-slate-800/60 text-slate-200 text-sm
+                       placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-fuchsia-500/40
+                       disabled:opacity-40 disabled:cursor-not-allowed"
+              />
+              <button
+                @click="handleFollowUp"
+                :disabled="!followUpText.trim() || turnCount >= 4"
+                class="px-4 py-2.5 rounded-lg bg-fuchsia-600 hover:bg-fuchsia-500 text-white text-sm font-medium
+                       cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                Send
+              </button>
+            </div>
+            <div class="flex items-center justify-between mt-1.5">
+              <p class="text-[10px] text-slate-600">
+                Turn {{ turnCount }}/4 · Try "something cheaper", "make it vegan", or "actually, I want a drink"
+              </p>
+              <button
+                @click="restart"
+                class="text-[10px] text-slate-600 hover:text-fuchsia-400 transition-colors cursor-pointer underline"
+              >
+                Start fresh
+              </button>
+            </div>
+          </div>
         </div>
 
         <!-- Upsell -->
