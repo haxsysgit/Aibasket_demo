@@ -178,12 +178,18 @@ def format_product_catalog(products: list[dict]) -> str:
         upsell_ids = [u["product_id"] for u in p.get("upsell_pairs", [])]
         upsell_str = ", ".join(upsell_ids) if upsell_ids else "none"
 
+        pop = p.get("popularity_score", 0)
+        conv = p.get("conversion_score", 0)
+        margin = p.get("margin_score", 0)
+
         lines.append(
             f'- id:{p["id"]} | {p["name"]} | £{p["price"]:.2f} | '
             f'cat:{p["category"]} | tags:[{tags}] | dietary:[{dietary}] | '
             f'allergens:[{allergens}] | taste:[{taste}] | '
             f'size:{p.get("portion_size","?")} | cal:{p.get("calories_band","?")} | '
-            f'prep:{p.get("prep_time_minutes","?")}min | upsells:[{upsell_str}]'
+            f'prep:{p.get("prep_time_minutes","?")}min | '
+            f'popularity:{pop} | conversion:{conv} | margin:{margin} | '
+            f'upsells:[{upsell_str}]'
         )
     return "\n".join(lines)
 
@@ -292,6 +298,15 @@ def validate_recommendation(raw: dict, valid_ids: set[str]) -> dict | None:
     elif len(message) > 800:
         message = message[:800].rsplit(".", 1)[0] + "."
 
+    # Validate cross_sell_id
+    cross_sell_id = raw.get("cross_sell_id")
+    if cross_sell_id and cross_sell_id not in valid_ids:
+        logger.warning("Stripped hallucinated cross_sell_id: %s", cross_sell_id)
+        cross_sell_id = None
+    # Don't cross-sell something already recommended or in basket
+    if cross_sell_id and cross_sell_id in valid_rec_ids:
+        cross_sell_id = None
+
     # Validate clarification
     clarification = None
     if raw.get("needs_clarification"):
@@ -301,6 +316,7 @@ def validate_recommendation(raw: dict, valid_ids: set[str]) -> dict | None:
 
     return {
         "recommended_ids": valid_rec_ids[:3],
+        "cross_sell_id": cross_sell_id,
         "reasoning": raw.get("reasoning", ""),
         "message": message,
         "needs_clarification": bool(clarification),

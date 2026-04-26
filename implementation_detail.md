@@ -197,7 +197,7 @@ The UI mirrors the Strivonex brand: slate-950 backgrounds, fuchsia-to-cyan gradi
 │       └── products.json     # Copy for static deployment
 │
 ├── tests/
-│   └── test_api.py           # 42 pytest tests (API, chat, validation, YAML prompts)
+│   └── test_api.py           # 46 pytest tests (API, chat, validation, cross-sell, commercial)
 │
 ├── deploy/
 │   ├── setup.sh              # One-command Ubuntu deploy
@@ -331,7 +331,7 @@ The store type dropdown resets everything — basket, recommendations, stage —
 
 ## 8. Testing
 
-42 automated tests cover all endpoints, the chat flow, and the validation layer:
+46 automated tests cover all endpoints, the chat flow, and the validation layer:
 
 - **Intent classification** — light lunch, quick snack, vegan request, budget signal, vague input
 - **Recommendations** — correct count per behaviour, clarification logic, required fields, category filtering
@@ -339,12 +339,13 @@ The store type dropdown resets everything — basket, recommendations, stage —
 - **Upsell** — returns complementary product, excludes basket items, handles invalid IDs
 - **Multi-turn chat** — basic chat, response shape, history handling, max turns (4), basket awareness, clarification on first turn only, empty messages
 - **Validation layer** — intent stripping (bad categories/preferences/modifiers/dietary/behaviour), response text rejection (empty, too short, too long), clarification sanitisation
-- **Recommendation validation** — hallucinated product IDs stripped, all-hallucinated returns None, limits to 3 products, clarification pass-through
+- **Recommendation validation** — hallucinated product IDs stripped, all-hallucinated returns None, limits to 3 products, clarification pass-through, cross-sell validation (hallucinated, duplicate, valid)
 - **YAML prompt** — template loads correctly, `{shop_type}` substitution works per store type, rendered prompts contain correct shop context
-- **Catalog formatting** — product catalog renders with all fields (id, name, price, dietary, upsells)
+- **Catalog formatting** — product catalog renders with all fields (id, name, price, dietary, upsells, popularity, conversion, margin)
+- **Commercial strategy** — YAML contains commercial_strategy section with cross_sell, margin, popularity, basket_value
 
 ```bash
-uv run pytest tests/ -v   # 42 passed
+uv run pytest tests/ -v   # 46 passed
 ```
 
 ---
@@ -394,13 +395,14 @@ The LLM (GPT-4o-mini) is the **primary recommendation engine**. On every `/api/c
 
 The system prompt is defined in `llm/prompts/recommend.yaml` — not as a Python string constant. This is deliberate:
 
-- **Structured YAML > unstructured prose.** LLMs parse structured input more reliably. Sections like `product_selection`, `message_rules`, `multi_turn`, and `clarification` are clearly delineated.
-- **Dynamic `{shop_type}` substitution.** The role field reads `"You are an AI shopping assistant for a {shop_type}."` At runtime, `{shop_type}` becomes "café", "pub", "bakery", or "corner shop".
+- **Structured YAML > unstructured prose.** LLMs parse structured input more reliably. Sections like `product_selection`, `commercial_strategy`, `message_rules`, `multi_turn`, and `clarification` are clearly delineated.
+- **Dynamic `{shop_type}` substitution.** The role field reads `"You are an AI basket-building assistant for a {shop_type}."` At runtime, `{shop_type}` becomes "café", "pub", "bakery", or "corner shop".
 - **Per-store context injection.** The YAML contains a `shop_context` map with descriptions for each store type. Only the relevant one is injected:
-  - *café*: "A casual café serving fresh food, hot drinks, and light bites..."
-  - *pub*: "A traditional British pub serving hearty meals, bar snacks, and drinks..."
-  - *bakery*: "A high-street bakery selling fresh bread, pastries, cakes..."
-  - *corner shop*: "A convenience store selling prepacked food, drinks, and snacks..."
+  - *café*: "...Margins are best on hot drinks and baked goods. Average basket: 2-3 items."
+  - *pub*: "...Margins are best on drinks and sides. Average basket: 2 items."
+  - *bakery*: "...Margins are best on cakes and speciality drinks. Average basket: 2 items."
+  - *corner shop*: "...Margins are best on drinks and confectionery. Average basket: 1-2 items."
+- **Commercial strategy section.** The YAML tells the LLM how to use `popularity_score`, `conversion_score`, and `margin_score` — prefer popular, high-converting products when equally relevant, use margin as a gentle tiebreaker. It also instructs the LLM on cross-selling (suggest a drink with food, a snack with a drink) and basket value (gently increase without being pushy).
 - **Editable without code changes.** Prompt tuning is a YAML edit, not a Python deploy.
 - **Visible in the UI.** The prompt transparency panel shows both the raw YAML template and the rendered version with shop type substituted.
 
@@ -412,8 +414,8 @@ The user prompt sent to the model contains:
 Customer said: "I want something healthy and light"
 
 --- PRODUCT CATALOG (20 items) ---
-- id:cafe_001 | Flat White | £3.40 | cat:drink | tags:[classic, hot, milk] | dietary:[vegetarian] | ...
-- id:cafe_002 | Avocado Toast | £7.50 | cat:lunch | tags:[healthy, light, fresh] | dietary:[vegan] | ...
+- id:cafe_001 | Flat White | £3.40 | cat:drink | tags:[classic, hot, milk] | dietary:[vegetarian] | ... | popularity:92 | conversion:88 | margin:72 | upsells:[cafe_007]
+- id:cafe_002 | Avocado Toast | £7.50 | cat:lunch | tags:[healthy, light, fresh] | dietary:[vegan] | ... | popularity:88 | conversion:82 | margin:70 | upsells:[cafe_012]
 ... (all store products)
 
 --- ALREADY IN BASKET (do not recommend these) ---
@@ -425,8 +427,9 @@ The LLM returns structured JSON:
 ```json
 {
   "recommended_ids": ["cafe_002", "cafe_016"],
-  "reasoning": "Avocado Toast is light, fresh, and vegan. The Acai Bowl is a healthy option with fruit.",
-  "message": "The Avocado Toast would be perfect — it's light, fresh, and only £7.50. If you're after something a bit different, the Acai Bowl is packed with fruit and is naturally vegan too.",
+  "cross_sell_id": "cafe_001",
+  "reasoning": "Avocado Toast is light, fresh, and vegan — it's also the most popular lunch item. The Acai Bowl is a healthy alternative. Cross-selling a Flat White since most café customers pair food with a hot drink.",
+  "message": "The Avocado Toast would be perfect — it's light, fresh, and only £7.50. If you're after something a bit different, the Acai Bowl is packed with fruit and is naturally vegan too. A Flat White goes really well with either if you fancy a coffee.",
   "needs_clarification": false,
   "clarification_question": null
 }
@@ -441,6 +444,8 @@ Every LLM response passes through `validate_recommendation()`:
 | Product ID not in catalog | Stripped from results |
 | All product IDs hallucinated | Returns `None` → deterministic fallback |
 | More than 3 products | Truncated to 3 |
+| Cross-sell ID not in catalog | Set to `null` |
+| Cross-sell duplicates a recommendation | Set to `null` |
 | Message too short (<10 chars) | Set to `None` → static template used |
 | Message too long (>800 chars) | Truncated at last sentence boundary |
 | Clarification question too short/long | Rejected |

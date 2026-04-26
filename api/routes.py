@@ -216,6 +216,7 @@ def chat(req: ChatRequest):
                 "user": user_prompt,
                 "model_output": {
                     "recommended_ids": llm_result["recommended_ids"],
+                    "cross_sell_id": llm_result.get("cross_sell_id"),
                     "reasoning": llm_result["reasoning"],
                     "message": llm_result["message"],
                     "needs_clarification": llm_result["needs_clarification"],
@@ -237,12 +238,21 @@ def chat(req: ChatRequest):
             rec_products = [product_map[pid] for pid in llm_result["recommended_ids"] if pid in product_map]
             product_outs = [_product_to_out(p) for p in rec_products]
 
+            # Cross-sell: LLM suggested a complementary product (validated)
+            cross_sell_out = None
+            cross_sell_id = llm_result.get("cross_sell_id")
+            if cross_sell_id and cross_sell_id in product_map and cross_sell_id not in set(req.basket_ids):
+                cross_sell_out = _product_to_out(product_map[cross_sell_id])
+
             # Upsell: deterministic selection from the first recommended product
             upsell_out = None
             upsell_msg = ""
             if rec_products:
                 basket_set = set(req.basket_ids)
-                upsell_product = get_upsell(rec_products[0], list(product_map.values()), basket_set)
+                rec_ids_set = set(llm_result["recommended_ids"])
+                if cross_sell_id:
+                    rec_ids_set.add(cross_sell_id)
+                upsell_product = get_upsell(rec_products[0], list(product_map.values()), basket_set | rec_ids_set)
                 if upsell_product:
                     upsell_out = _product_to_out(upsell_product)
                     upsell_msg = f"Most people pair this with a {upsell_product.name}"
@@ -262,6 +272,7 @@ def chat(req: ChatRequest):
             return ChatResponse(
                 products=product_outs,
                 ai_message=ai_msg,
+                cross_sell=cross_sell_out,
                 upsell=upsell_out,
                 upsell_message=upsell_msg,
                 intent_used=intent_response,

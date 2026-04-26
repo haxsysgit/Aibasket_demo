@@ -465,6 +465,45 @@ class TestValidation:
         assert "corner shop" in rendered_cs
         assert "convenience" in rendered_cs.lower() or "rush" in rendered_cs.lower()
 
+    def test_validate_recommendation_cross_sell_valid(self):
+        from llm.openai_client import validate_recommendation
+        valid_ids = {"cafe_001", "cafe_002", "cafe_003"}
+        raw = {
+            "recommended_ids": ["cafe_001"],
+            "cross_sell_id": "cafe_003",
+            "reasoning": "Good pick",
+            "message": "I'd recommend the wrap — and grab a coffee too.",
+        }
+        result = validate_recommendation(raw, valid_ids)
+        assert result is not None
+        assert result["cross_sell_id"] == "cafe_003"
+
+    def test_validate_recommendation_cross_sell_hallucinated(self):
+        from llm.openai_client import validate_recommendation
+        valid_ids = {"cafe_001", "cafe_002"}
+        raw = {
+            "recommended_ids": ["cafe_001"],
+            "cross_sell_id": "FAKE_999",
+            "reasoning": "Good pick",
+            "message": "Here's a nice wrap for you.",
+        }
+        result = validate_recommendation(raw, valid_ids)
+        assert result is not None
+        assert result["cross_sell_id"] is None
+
+    def test_validate_recommendation_cross_sell_no_duplicate(self):
+        from llm.openai_client import validate_recommendation
+        valid_ids = {"cafe_001", "cafe_002"}
+        raw = {
+            "recommended_ids": ["cafe_001"],
+            "cross_sell_id": "cafe_001",  # same as recommendation
+            "reasoning": "Good pick",
+            "message": "Here's the wrap.",
+        }
+        result = validate_recommendation(raw, valid_ids)
+        assert result is not None
+        assert result["cross_sell_id"] is None  # stripped because it duplicates
+
     def test_format_product_catalog(self):
         from llm.openai_client import format_product_catalog
         products = [
@@ -474,6 +513,7 @@ class TestValidation:
                 "dietary": ["vegan"], "allergens": ["gluten"],
                 "taste_profile": ["savory"], "portion_size": "medium",
                 "calories_band": "300-400", "prep_time_minutes": 3,
+                "popularity_score": 85, "conversion_score": 78, "margin_score": 60,
                 "upsell_pairs": [{"product_id": "test_002", "type": "drink"}],
             }
         ]
@@ -483,3 +523,15 @@ class TestValidation:
         assert "£5.00" in catalog
         assert "vegan" in catalog
         assert "test_002" in catalog
+        assert "popularity:85" in catalog
+        assert "conversion:78" in catalog
+        assert "margin:60" in catalog
+
+    def test_yaml_prompt_has_commercial_strategy(self):
+        from llm.openai_client import get_recommend_yaml_raw
+        raw = get_recommend_yaml_raw()
+        assert "commercial_strategy:" in raw
+        assert "cross_sell" in raw
+        assert "margin" in raw
+        assert "popularity" in raw
+        assert "basket_value" in raw

@@ -69,6 +69,7 @@ class ChatResponse(BaseModel):
     products: list[ProductOut]
     ai_message: str = ""
     clarification: str | None = None
+    cross_sell: ProductOut | None = None
     upsell: ProductOut | None = None
     upsell_message: str = ""
     intent_used: ClassifyResponse | None = None
